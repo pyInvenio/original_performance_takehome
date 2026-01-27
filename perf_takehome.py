@@ -164,8 +164,7 @@ class KernelBuilder:
             ("vbroadcast", v_five, five_const),
         ]})
 
-        self.add("flow", ("pause",))
-        self.add("debug", ("comment", "Starting loop"))
+        self.instrs.append({"flow": [("pause",)], "debug": [("comment", "Starting loop")]})
 
         # ===== HASH CONSTANTS =====
         v_hash_const1 = [self.alloc_vec(f"v_hash{i}_const1") for i in range(6)]
@@ -269,8 +268,13 @@ class KernelBuilder:
             group_end = min(group_start + GROUP_SIZE, n_batches)
             active = group_end - group_start
 
-            # Load batches
-            for g in range(active):
+            # Load batches - overlap last few with round 0 XOR
+            # We need ceil(active/6) cycles to XOR all batches
+            # So load active - ceil(active/6) batches first, then overlap the rest
+            xor_cycles_needed = (active + 5) // 6  # ceil division
+            load_overlap_start = max(0, active - xor_cycles_needed)
+
+            for g in range(load_overlap_start):
                 batch = group_start + g
                 ctx = contexts[g]
                 self.instrs.append({"load": [
@@ -278,10 +282,34 @@ class KernelBuilder:
                     ("vload", ctx["val"], val_addrs[batch]),
                 ]})
 
+            # Overlap remaining loads with round 0 XOR (level 0)
+            xor_idx = 0
+            for g in range(load_overlap_start, active):
+                batch = group_start + g
+                ctx = contexts[g]
+                instr = {"load": [
+                    ("vload", ctx["idx"], idx_addrs[batch]),
+                    ("vload", ctx["val"], val_addrs[batch]),
+                ]}
+                # Add XOR ops for earlier batches (up to 6 per cycle)
+                if xor_idx < load_overlap_start:
+                    xor_ops = []
+                    for _ in range(min(6, load_overlap_start - xor_idx)):
+                        xor_ops.append(("^", contexts[xor_idx]["val"],
+                                       contexts[xor_idx]["val"], v_forest_nodes[0]))
+                        xor_idx += 1
+                    if xor_ops:
+                        instr["valu"] = xor_ops
+                self.instrs.append(instr)
+
+            # Track how many batches were XORed during loading
+            round0_xor_done = xor_idx
+
             # Process rounds with cross-round pipelining for consecutive scattered rounds
             round_num = 0
             # Track addr calc done from previous round (for pipelining)
             prev_round_addr_done = None
+            prev_round_loads_done = None
             while round_num < rounds:
                 level = round_num % (forest_height + 1)
                 need_scattered = level >= 3
@@ -316,18 +344,30 @@ class KernelBuilder:
                     load_queue = []  # (batch, pair_idx)
                     cycle = 0
 
-                    # Use pre-computed addr calc from previous round if available
+                    # Use pre-computed addr calc and loads from previous round if available
                     addr_done = [-1] * active
-                    addr_calc_queue = list(range(active))  # Batches needing addr calc
+                    # Interleave batch order: 0, 12, 1, 13, 2, 14, ... for better pipeline utilization
+                    interleaved = []
+                    for i in range(active // 2):
+                        interleaved.append(i)
+                        if i + active // 2 < active:
+                            interleaved.append(i + active // 2)
+                    addr_calc_queue = interleaved[:]  # Batches needing addr calc
                     if prev_round_addr_done is not None:
-                        # Mark pre-computed batches as done and queue their loads
+                        # Mark pre-computed batches as done and queue their loads (if not pre-loaded)
                         for g in range(active):
                             if prev_round_addr_done[g] >= 0:
                                 addr_done[g] = -1  # "done before this round"
-                                for pair in range(4):
-                                    load_queue.append((g, pair))
-                                addr_calc_queue.remove(g)  # Don't need addr calc
+                                # Check if loads were also pre-done
+                                if prev_round_loads_done is not None and prev_round_loads_done[g] >= 0:
+                                    loads_done[g] = -1  # "done before this round"
+                                else:
+                                    for pair in range(4):
+                                        load_queue.append((g, pair))
+                                if g in addr_calc_queue:
+                                    addr_calc_queue.remove(g)  # Don't need addr calc
                         prev_round_addr_done = None
+                        prev_round_loads_done = None
 
                     while not all(all_done):
                         instr = {}
@@ -374,8 +414,8 @@ class KernelBuilder:
                                     loads_done[batch] = cycle
 
                         # 3. Schedule VALU ops: XOR, hash stages, idx update
-                        # Process batches in order, greedily fill 6 VALU slots
-                        for g in range(active):
+                        # Process batches in interleaved order for better VALU packing
+                        for g in interleaved:
                             if len(valu_ops) >= 6:
                                 break
                             ctx = contexts[g]
@@ -498,29 +538,286 @@ class KernelBuilder:
                     continue
 
                 elif level == 0:
-                    emit_valu_chunked([
-                        ("^", contexts[g]["val"], contexts[g]["val"], v_forest_nodes[0])
-                        for g in range(active)
-                    ])
+                    # For round 0, some batches were XORed during loading (overlap optimization)
+                    start_batch = round0_xor_done if round_num == 0 else 0
+                    if start_batch < active:
+                        emit_valu_chunked([
+                            ("^", contexts[g]["val"], contexts[g]["val"], v_forest_nodes[0])
+                            for g in range(start_batch, active)
+                        ])
                 elif level == 1:
-                    for g in range(active):
-                        ctx = contexts[g]
-                        self.instrs.append({"valu": [("&", ctx["tmp1"], ctx["idx"], v_one)]})
-                        self.instrs.append({"flow": [("vselect", ctx["tmp2"], ctx["tmp1"],
-                                                      v_forest_nodes[1], v_forest_nodes[2])]})
-                        self.instrs.append({"valu": [("^", ctx["val"], ctx["val"], ctx["tmp2"])]})
+                    # Interleaved scheduling for level 1: & -> vselect -> ^ -> hash
+                    # Track when each stage completes
+                    and_cycle = [-1] * active
+                    vsel_cycle = [-1] * active
+                    xor_cycle = [-1] * active
+                    h0_cycle = [-1] * active
+                    h1p1_cycle = [-1] * active
+                    h1_cycle = [-1] * active
+                    h2_cycle = [-1] * active
+                    h3p1_cycle = [-1] * active
+                    h3_cycle = [-1] * active
+                    h4_cycle = [-1] * active
+                    h5p1_cycle = [-1] * active
+                    h5_cycle = [-1] * active
+                    idx_and_cycle = [-1] * active
+                    all_done = [False] * active
+
+                    cycle = 0
+                    and_idx = 0
+                    while not all(all_done):
+                        instr = {}
+                        valu_ops = []
+
+                        # Schedule vselect FIRST (1 per cycle) to keep pipeline flowing
+                        for g in range(active):
+                            if and_cycle[g] >= 0 and and_cycle[g] < cycle and vsel_cycle[g] < 0:
+                                ctx = contexts[g]
+                                instr["flow"] = [("vselect", ctx["tmp2"], ctx["tmp1"],
+                                                  v_forest_nodes[1], v_forest_nodes[2])]
+                                vsel_cycle[g] = cycle
+                                break
+
+                        # Fill VALU: prioritize XOR and hash from completed batches, then &
+                        for g in range(active):
+                            if len(valu_ops) >= 6:
+                                break
+                            ctx = contexts[g]
+
+                            # XOR needs vselect done previous cycle
+                            if vsel_cycle[g] >= 0 and vsel_cycle[g] < cycle and xor_cycle[g] < 0:
+                                valu_ops.append(("^", ctx["val"], ctx["val"], ctx["tmp2"]))
+                                xor_cycle[g] = cycle
+                                continue
+
+                            # Hash stage 0
+                            if xor_cycle[g] >= 0 and xor_cycle[g] < cycle and h0_cycle[g] < 0:
+                                valu_ops.append(("multiply_add", ctx["val"], ctx["val"], v_mult0, v_hash_const1[0]))
+                                h0_cycle[g] = cycle
+                                continue
+
+                            # Hash stage 1 part 1
+                            if h0_cycle[g] >= 0 and h0_cycle[g] < cycle and h1p1_cycle[g] < 0:
+                                if len(valu_ops) <= 4:
+                                    valu_ops.append((HASH_STAGES[1][0], ctx["tmp1"], ctx["val"], v_hash_const1[1]))
+                                    valu_ops.append((HASH_STAGES[1][3], ctx["tmp2"], ctx["val"], v_hash_const2[1]))
+                                    h1p1_cycle[g] = cycle
+                                continue
+
+                            # Hash stage 1 final
+                            if h1p1_cycle[g] >= 0 and h1p1_cycle[g] < cycle and h1_cycle[g] < 0:
+                                valu_ops.append((HASH_STAGES[1][2], ctx["val"], ctx["tmp1"], ctx["tmp2"]))
+                                h1_cycle[g] = cycle
+                                continue
+
+                            # Hash stage 2 + idx update
+                            if h1_cycle[g] >= 0 and h1_cycle[g] < cycle and h2_cycle[g] < 0:
+                                if len(valu_ops) <= 4:
+                                    valu_ops.append(("multiply_add", ctx["val"], ctx["val"], v_mult2, v_hash_const1[2]))
+                                    valu_ops.append(("multiply_add", ctx["idx"], ctx["idx"], v_two, v_one))
+                                    h2_cycle[g] = cycle
+                                continue
+
+                            # Hash stage 3 part 1
+                            if h2_cycle[g] >= 0 and h2_cycle[g] < cycle and h3p1_cycle[g] < 0:
+                                if len(valu_ops) <= 4:
+                                    valu_ops.append((HASH_STAGES[3][0], ctx["tmp1"], ctx["val"], v_hash_const1[3]))
+                                    valu_ops.append((HASH_STAGES[3][3], ctx["tmp2"], ctx["val"], v_hash_const2[3]))
+                                    h3p1_cycle[g] = cycle
+                                continue
+
+                            # Hash stage 3 final
+                            if h3p1_cycle[g] >= 0 and h3p1_cycle[g] < cycle and h3_cycle[g] < 0:
+                                valu_ops.append((HASH_STAGES[3][2], ctx["val"], ctx["tmp1"], ctx["tmp2"]))
+                                h3_cycle[g] = cycle
+                                continue
+
+                            # Hash stage 4
+                            if h3_cycle[g] >= 0 and h3_cycle[g] < cycle and h4_cycle[g] < 0:
+                                valu_ops.append(("multiply_add", ctx["val"], ctx["val"], v_mult4, v_hash_const1[4]))
+                                h4_cycle[g] = cycle
+                                continue
+
+                            # Hash stage 5 part 1
+                            if h4_cycle[g] >= 0 and h4_cycle[g] < cycle and h5p1_cycle[g] < 0:
+                                if len(valu_ops) <= 4:
+                                    valu_ops.append((HASH_STAGES[5][0], ctx["tmp1"], ctx["val"], v_hash_const1[5]))
+                                    valu_ops.append((HASH_STAGES[5][3], ctx["tmp2"], ctx["val"], v_hash_const2[5]))
+                                    h5p1_cycle[g] = cycle
+                                continue
+
+                            # Hash stage 5 final
+                            if h5p1_cycle[g] >= 0 and h5p1_cycle[g] < cycle and h5_cycle[g] < 0:
+                                valu_ops.append((HASH_STAGES[5][2], ctx["val"], ctx["tmp1"], ctx["tmp2"]))
+                                h5_cycle[g] = cycle
+                                continue
+
+                            # Index update part 1 (&)
+                            if h5_cycle[g] >= 0 and h5_cycle[g] < cycle and idx_and_cycle[g] < 0:
+                                valu_ops.append(("&", ctx["tmp1"], ctx["val"], v_one))
+                                idx_and_cycle[g] = cycle
+                                continue
+
+                            # Index update part 2 (+)
+                            if idx_and_cycle[g] >= 0 and idx_and_cycle[g] < cycle and not all_done[g]:
+                                valu_ops.append(("+", ctx["idx"], ctx["idx"], ctx["tmp1"]))
+                                all_done[g] = True
+
+                        # Fill remaining slots with & for new batches
+                        while len(valu_ops) < 6 and and_idx < active:
+                            ctx = contexts[and_idx]
+                            valu_ops.append(("&", ctx["tmp1"], ctx["idx"], v_one))
+                            and_cycle[and_idx] = cycle
+                            and_idx += 1
+
+                        if valu_ops:
+                            instr["valu"] = valu_ops[:6]
+                        if instr:
+                            self.instrs.append(instr)
+                        cycle += 1
+                        if cycle > 300:
+                            break
+
+                    # Skip the separate hash section for level 1
+                    round_num += 1
+                    continue
                 elif level == 2:
-                    for g in range(active):
-                        ctx = contexts[g]
-                        self.instrs.append({"valu": [("&", ctx["tmp1"], ctx["idx"], v_one)]})
-                        self.instrs.append({"flow": [("vselect", ctx["tmp2"], ctx["tmp1"],
-                                                      v_forest_nodes[3], v_forest_nodes[4])]})
-                        self.instrs.append({"flow": [("vselect", ctx["node"], ctx["tmp1"],
-                                                      v_forest_nodes[5], v_forest_nodes[6])]})
-                        self.instrs.append({"valu": [("<", ctx["tmp1"], ctx["idx"], v_five)]})
-                        self.instrs.append({"flow": [("vselect", ctx["tmp2"], ctx["tmp1"],
-                                                      ctx["tmp2"], ctx["node"])]})
-                        self.instrs.append({"valu": [("^", ctx["val"], ctx["val"], ctx["tmp2"])]})
+                    # Interleaved scheduling for level 2
+                    # Stages: & -> vsel1,vsel2 -> < -> vsel3 -> ^ -> hash
+                    and1_cycle = [-1] * active
+                    vsel1_cycle = [-1] * active
+                    vsel2_cycle = [-1] * active
+                    lt_cycle = [-1] * active
+                    vsel3_cycle = [-1] * active
+                    xor_cycle = [-1] * active
+                    h0_cycle = [-1] * active
+                    h1p1_cycle = [-1] * active
+                    h1_cycle = [-1] * active
+                    h2_cycle = [-1] * active
+                    h3p1_cycle = [-1] * active
+                    h3_cycle = [-1] * active
+                    h4_cycle = [-1] * active
+                    h5p1_cycle = [-1] * active
+                    h5_cycle = [-1] * active
+                    idx_and_cycle = [-1] * active
+                    all_done = [False] * active
+
+                    cycle = 0
+                    and1_idx = 0
+                    while not all(all_done):
+                        instr = {}
+                        valu_ops = []
+
+                        # Schedule vselects FIRST (priority: vsel1, vsel2, then vsel3)
+                        for g in range(active):
+                            if and1_cycle[g] >= 0 and and1_cycle[g] < cycle and vsel1_cycle[g] < 0:
+                                ctx = contexts[g]
+                                instr["flow"] = [("vselect", ctx["tmp2"], ctx["tmp1"],
+                                                  v_forest_nodes[3], v_forest_nodes[4])]
+                                vsel1_cycle[g] = cycle
+                                break
+                            if vsel1_cycle[g] >= 0 and vsel1_cycle[g] < cycle and vsel2_cycle[g] < 0:
+                                ctx = contexts[g]
+                                instr["flow"] = [("vselect", ctx["node"], ctx["tmp1"],
+                                                  v_forest_nodes[5], v_forest_nodes[6])]
+                                vsel2_cycle[g] = cycle
+                                break
+                            if lt_cycle[g] >= 0 and lt_cycle[g] < cycle and vsel3_cycle[g] < 0:
+                                ctx = contexts[g]
+                                instr["flow"] = [("vselect", ctx["tmp2"], ctx["tmp1"],
+                                                  ctx["tmp2"], ctx["node"])]
+                                vsel3_cycle[g] = cycle
+                                break
+
+                        # Fill VALU slots with <, ^, and hash stages
+                        for g in range(active):
+                            if len(valu_ops) >= 6:
+                                break
+                            ctx = contexts[g]
+
+                            # < needs vsel2 done (so tmp1 is free to reuse)
+                            if vsel2_cycle[g] >= 0 and vsel2_cycle[g] < cycle and lt_cycle[g] < 0:
+                                valu_ops.append(("<", ctx["tmp1"], ctx["idx"], v_five))
+                                lt_cycle[g] = cycle
+                                continue
+
+                            # XOR needs vsel3 done
+                            if vsel3_cycle[g] >= 0 and vsel3_cycle[g] < cycle and xor_cycle[g] < 0:
+                                valu_ops.append(("^", ctx["val"], ctx["val"], ctx["tmp2"]))
+                                xor_cycle[g] = cycle
+                                continue
+
+                            # Hash stages (same as level 1)
+                            if xor_cycle[g] >= 0 and xor_cycle[g] < cycle and h0_cycle[g] < 0:
+                                valu_ops.append(("multiply_add", ctx["val"], ctx["val"], v_mult0, v_hash_const1[0]))
+                                h0_cycle[g] = cycle
+                                continue
+                            if h0_cycle[g] >= 0 and h0_cycle[g] < cycle and h1p1_cycle[g] < 0:
+                                if len(valu_ops) <= 4:
+                                    valu_ops.append((HASH_STAGES[1][0], ctx["tmp1"], ctx["val"], v_hash_const1[1]))
+                                    valu_ops.append((HASH_STAGES[1][3], ctx["tmp2"], ctx["val"], v_hash_const2[1]))
+                                    h1p1_cycle[g] = cycle
+                                continue
+                            if h1p1_cycle[g] >= 0 and h1p1_cycle[g] < cycle and h1_cycle[g] < 0:
+                                valu_ops.append((HASH_STAGES[1][2], ctx["val"], ctx["tmp1"], ctx["tmp2"]))
+                                h1_cycle[g] = cycle
+                                continue
+                            if h1_cycle[g] >= 0 and h1_cycle[g] < cycle and h2_cycle[g] < 0:
+                                if len(valu_ops) <= 4:
+                                    valu_ops.append(("multiply_add", ctx["val"], ctx["val"], v_mult2, v_hash_const1[2]))
+                                    valu_ops.append(("multiply_add", ctx["idx"], ctx["idx"], v_two, v_one))
+                                    h2_cycle[g] = cycle
+                                continue
+                            if h2_cycle[g] >= 0 and h2_cycle[g] < cycle and h3p1_cycle[g] < 0:
+                                if len(valu_ops) <= 4:
+                                    valu_ops.append((HASH_STAGES[3][0], ctx["tmp1"], ctx["val"], v_hash_const1[3]))
+                                    valu_ops.append((HASH_STAGES[3][3], ctx["tmp2"], ctx["val"], v_hash_const2[3]))
+                                    h3p1_cycle[g] = cycle
+                                continue
+                            if h3p1_cycle[g] >= 0 and h3p1_cycle[g] < cycle and h3_cycle[g] < 0:
+                                valu_ops.append((HASH_STAGES[3][2], ctx["val"], ctx["tmp1"], ctx["tmp2"]))
+                                h3_cycle[g] = cycle
+                                continue
+                            if h3_cycle[g] >= 0 and h3_cycle[g] < cycle and h4_cycle[g] < 0:
+                                valu_ops.append(("multiply_add", ctx["val"], ctx["val"], v_mult4, v_hash_const1[4]))
+                                h4_cycle[g] = cycle
+                                continue
+                            if h4_cycle[g] >= 0 and h4_cycle[g] < cycle and h5p1_cycle[g] < 0:
+                                if len(valu_ops) <= 4:
+                                    valu_ops.append((HASH_STAGES[5][0], ctx["tmp1"], ctx["val"], v_hash_const1[5]))
+                                    valu_ops.append((HASH_STAGES[5][3], ctx["tmp2"], ctx["val"], v_hash_const2[5]))
+                                    h5p1_cycle[g] = cycle
+                                continue
+                            if h5p1_cycle[g] >= 0 and h5p1_cycle[g] < cycle and h5_cycle[g] < 0:
+                                valu_ops.append((HASH_STAGES[5][2], ctx["val"], ctx["tmp1"], ctx["tmp2"]))
+                                h5_cycle[g] = cycle
+                                continue
+                            if h5_cycle[g] >= 0 and h5_cycle[g] < cycle and idx_and_cycle[g] < 0:
+                                valu_ops.append(("&", ctx["tmp1"], ctx["val"], v_one))
+                                idx_and_cycle[g] = cycle
+                                continue
+                            if idx_and_cycle[g] >= 0 and idx_and_cycle[g] < cycle and not all_done[g]:
+                                valu_ops.append(("+", ctx["idx"], ctx["idx"], ctx["tmp1"]))
+                                all_done[g] = True
+
+                        # Fill remaining slots with first & for new batches
+                        while len(valu_ops) < 6 and and1_idx < active:
+                            ctx = contexts[and1_idx]
+                            valu_ops.append(("&", ctx["tmp1"], ctx["idx"], v_one))
+                            and1_cycle[and1_idx] = cycle
+                            and1_idx += 1
+
+                        if valu_ops:
+                            instr["valu"] = valu_ops[:6]
+                        if instr:
+                            self.instrs.append(instr)
+                        cycle += 1
+                        if cycle > 400:
+                            break
+
+                    # Skip the separate hash section for level 2
+                    round_num += 1
+                    continue
                 else:
                     emit_valu_chunked([
                         ("^", contexts[g]["val"], contexts[g]["val"], contexts[g]["node"])
