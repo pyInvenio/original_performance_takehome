@@ -117,6 +117,7 @@ class KernelBuilder:
         v_two = self.alloc_scratch("v_two", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_five = self.alloc_scratch("v_five", VLEN)
 
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -140,12 +141,15 @@ class KernelBuilder:
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
+        five_const = self.scratch_const(5)
+
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
         self.instrs.append({"valu": [("vbroadcast", v_two, two_const),
                                      ("vbroadcast", v_one, one_const),
                                      ("vbroadcast", v_zero, zero_const),
-                                     ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])]})
+                                     ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+                                     ("vbroadcast", v_five, five_const)]})
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -156,12 +160,8 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
 
         # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr_1 = self.alloc_scratch("tmp_addr_1")
         tmp_addr_2 = self.alloc_scratch("tmp_addr_2")
-        tmp_addr_3 = self.alloc_scratch("tmp_addr_3")
         tmp_addrs_a = [self.alloc_scratch(f"tmp_addr_a_{i}") for i in range(VLEN)]
         tmp_addrs_b = [self.alloc_scratch(f"tmp_addr_b_{i}") for i in range(VLEN)]
 
@@ -199,6 +199,28 @@ class KernelBuilder:
                 ("vbroadcast", v_hash5_const1, self.scratch_const(HASH_STAGES[5][1])),
                 ("vbroadcast", v_hash5_const2, self.scratch_const(HASH_STAGES[5][4])),
         ]})
+
+        v_forest_node_0 = self.alloc_scratch("v_forest_node_0", VLEN)
+        v_forest_node_1 = self.alloc_scratch("v_forest_node_1", VLEN)
+        v_forest_node_2 = self.alloc_scratch("v_forest_node_2", VLEN)
+        v_forest_node_3 = self.alloc_scratch("v_forest_node_3", VLEN)
+        v_forest_node_4 = self.alloc_scratch("v_forest_node_4", VLEN)
+        v_forest_node_5 = self.alloc_scratch("v_forest_node_5", VLEN)
+        v_forest_node_6 = self.alloc_scratch("v_forest_node_6", VLEN)
+
+        forest_node_cache = self.alloc_scratch("forest_node_cache", 8)
+        self.instrs.append({"load": [
+            ("vload", forest_node_cache, self.scratch["forest_values_p"])
+        ]})
+        self.instrs.append({"valu": [
+            ("vbroadcast", v_forest_node_0, forest_node_cache + 0),
+            ("vbroadcast", v_forest_node_1, forest_node_cache + 1),
+            ("vbroadcast", v_forest_node_2, forest_node_cache + 2),
+            ("vbroadcast", v_forest_node_3, forest_node_cache + 3),
+            ("vbroadcast", v_forest_node_4, forest_node_cache + 4),
+            ("vbroadcast", v_forest_node_5, forest_node_cache + 5),
+        ]})
+        self.instrs.append({"valu": [("vbroadcast", v_forest_node_6, forest_node_cache + 6)]})
 
 
         def do_address_calc(offset_const, tmp_addr_1, tmp_addr_2):
@@ -247,8 +269,9 @@ class KernelBuilder:
             # first batch
             do_address_calc(offset_const_0, tmp_addr_1, tmp_addr_2)
             do_vloads(v_idx_cur, v_val_cur, tmp_addr_1, tmp_addr_2)
-            do_scattered_address_calc(v_idx_cur, tmp_addrs_cur)
-            do_scattered_loads(v_node_val_cur, tmp_addrs_cur)
+            if round >= 3:
+                do_scattered_address_calc(v_idx_cur, tmp_addrs_cur)
+                do_scattered_loads(v_node_val_cur, tmp_addrs_cur)
 
             for offset in range(0, batch_size - VLEN, VLEN):
                 offset_const = self.scratch_const(offset)
@@ -259,8 +282,32 @@ class KernelBuilder:
 
                 v_idx_cur, v_val_cur, v_node_val_cur, tmp_addrs_cur = buffers[cur_buf]
                 v_idx_next, v_val_next, v_node_val_next, tmp_addrs_next = buffers[next_buf]
-
-                self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_node_val_cur)]})
+                if round == 0:
+                    self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_forest_node_0)]})
+                elif round == 1:
+                    self.instrs.append({"valu": [("&", v_tmp1, v_idx_cur, v_one)]})
+                    self.instrs.append(
+                        {
+                            "flow":
+                            [(
+                                "vselect",
+                                v_tmp2,
+                                v_tmp1,
+                                v_forest_node_1,
+                                v_forest_node_2,
+                            )]
+                        }
+                    )
+                    self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_tmp2)]})
+                elif round == 2:
+                    self.instrs.append({"valu": [("&", v_tmp1, v_idx_cur, v_one)]})
+                    self.instrs.append({"flow": [("vselect", v_tmp2, v_tmp1, v_forest_node_3, v_forest_node_4)]})
+                    self.instrs.append({"flow": [("vselect", v_node_val_cur, v_tmp1, v_forest_node_5, v_forest_node_6)]})
+                    self.instrs.append({"valu": [("<", v_tmp1, v_idx_cur, v_five)]})
+                    self.instrs.append({"flow": [("vselect", v_tmp2, v_tmp1, v_tmp2, v_node_val_cur)]})
+                    self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_tmp2)]})
+                else:
+                    self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_node_val_cur)]})
 
                 self.instrs.append({"valu": [
                                         (HASH_STAGES[0][0], v_tmp1, v_val_cur, v_hash0_const1),
@@ -275,55 +322,71 @@ class KernelBuilder:
                                     ("vload", v_idx_next, tmp_addr_1),
                                     ("vload", v_val_next, tmp_addr_2)]})
 
-                self.instrs.append({"valu": [
-                    (HASH_STAGES[1][0], v_tmp1, v_val_cur, v_hash1_const1),
-                    (HASH_STAGES[1][3], v_tmp2, v_val_cur, v_hash1_const2)
-                    ],
-                    "alu": [
-                    ("+", tmp_addrs_next[0], self.scratch["forest_values_p"], v_idx_next + 0),
-                    ("+", tmp_addrs_next[1], self.scratch["forest_values_p"], v_idx_next + 1),
-                    ("+", tmp_addrs_next[2], self.scratch["forest_values_p"], v_idx_next + 2),
-                    ("+", tmp_addrs_next[3], self.scratch["forest_values_p"], v_idx_next + 3),
-                    ("+", tmp_addrs_next[4], self.scratch["forest_values_p"], v_idx_next + 4),
-                    ("+", tmp_addrs_next[5], self.scratch["forest_values_p"], v_idx_next + 5),
-                    ("+", tmp_addrs_next[6], self.scratch["forest_values_p"], v_idx_next + 6),
-                    ("+", tmp_addrs_next[7], self.scratch["forest_values_p"], v_idx_next + 7),
-                ]})
-
-                self.instrs.append({
-                    "valu": [(HASH_STAGES[1][2], v_val_cur, v_tmp1, v_tmp2),
-                             ("*", v_idx_cur, v_idx_cur, v_two)],
-                    "load": [
-                    ("load", v_node_val_next + 0, tmp_addrs_next[0]),
-                    ("load", v_node_val_next + 1, tmp_addrs_next[1]),
-                ]})
-
-                self.instrs.append({
-                    "valu": [
-                    (HASH_STAGES[2][0], v_tmp1, v_val_cur, v_hash2_const1),
-                    (HASH_STAGES[2][3], v_tmp2, v_val_cur, v_hash2_const2),
-                    ("+", v_idx_cur, v_idx_cur, v_one)
-                    ],
-                    "load": [
-                    ("load", v_node_val_next + 2, tmp_addrs_next[2]),
-                    ("load", v_node_val_next + 3, tmp_addrs_next[3]),
-                ]})
-
-                self.instrs.append({"valu":
-                                    [(HASH_STAGES[2][2], v_val_cur, v_tmp1, v_tmp2)],
-                                    "load": [
-                                    ("load", v_node_val_next + 4, tmp_addrs_next[4]),
-                                    ("load", v_node_val_next + 5, tmp_addrs_next[5]),
-                ]})
-
-                self.instrs.append({"valu": [
-                    (HASH_STAGES[3][0], v_tmp1, v_val_cur, v_hash3_const1),
-                    (HASH_STAGES[3][3], v_tmp2, v_val_cur, v_hash3_const2)
-                    ],
-                    "load": [
-                    ("load", v_node_val_next + 6, tmp_addrs_next[6]),
-                    ("load", v_node_val_next + 7, tmp_addrs_next[7]),
-                ]})
+                if round >= 3:
+                    self.instrs.append({"valu": [
+                        (HASH_STAGES[1][0], v_tmp1, v_val_cur, v_hash1_const1),
+                        (HASH_STAGES[1][3], v_tmp2, v_val_cur, v_hash1_const2)
+                        ],
+                        "alu": [
+                        ("+", tmp_addrs_next[0], self.scratch["forest_values_p"], v_idx_next + 0),
+                        ("+", tmp_addrs_next[1], self.scratch["forest_values_p"], v_idx_next + 1),
+                        ("+", tmp_addrs_next[2], self.scratch["forest_values_p"], v_idx_next + 2),
+                        ("+", tmp_addrs_next[3], self.scratch["forest_values_p"], v_idx_next + 3),
+                        ("+", tmp_addrs_next[4], self.scratch["forest_values_p"], v_idx_next + 4),
+                        ("+", tmp_addrs_next[5], self.scratch["forest_values_p"], v_idx_next + 5),
+                        ("+", tmp_addrs_next[6], self.scratch["forest_values_p"], v_idx_next + 6),
+                        ("+", tmp_addrs_next[7], self.scratch["forest_values_p"], v_idx_next + 7),
+                    ]})
+                    self.instrs.append({
+                        "valu": [(HASH_STAGES[1][2], v_val_cur, v_tmp1, v_tmp2),
+                                 ("*", v_idx_cur, v_idx_cur, v_two)],
+                        "load": [
+                        ("load", v_node_val_next + 0, tmp_addrs_next[0]),
+                        ("load", v_node_val_next + 1, tmp_addrs_next[1]),
+                    ]})
+                    self.instrs.append({
+                        "valu": [
+                        (HASH_STAGES[2][0], v_tmp1, v_val_cur, v_hash2_const1),
+                        (HASH_STAGES[2][3], v_tmp2, v_val_cur, v_hash2_const2),
+                        ("+", v_idx_cur, v_idx_cur, v_one)
+                        ],
+                        "load": [
+                        ("load", v_node_val_next + 2, tmp_addrs_next[2]),
+                        ("load", v_node_val_next + 3, tmp_addrs_next[3]),
+                    ]})
+                    self.instrs.append({"valu":
+                                        [(HASH_STAGES[2][2], v_val_cur, v_tmp1, v_tmp2)],
+                                        "load": [
+                                        ("load", v_node_val_next + 4, tmp_addrs_next[4]),
+                                        ("load", v_node_val_next + 5, tmp_addrs_next[5]),
+                    ]})
+                    self.instrs.append({"valu": [
+                        (HASH_STAGES[3][0], v_tmp1, v_val_cur, v_hash3_const1),
+                        (HASH_STAGES[3][3], v_tmp2, v_val_cur, v_hash3_const2)
+                        ],
+                        "load": [
+                        ("load", v_node_val_next + 6, tmp_addrs_next[6]),
+                        ("load", v_node_val_next + 7, tmp_addrs_next[7]),
+                    ]})
+                else:
+                    self.instrs.append({"valu": [
+                        (HASH_STAGES[1][0], v_tmp1, v_val_cur, v_hash1_const1),
+                        (HASH_STAGES[1][3], v_tmp2, v_val_cur, v_hash1_const2)
+                    ]})
+                    self.instrs.append({"valu": [
+                        (HASH_STAGES[1][2], v_val_cur, v_tmp1, v_tmp2),
+                        ("*", v_idx_cur, v_idx_cur, v_two)
+                    ]})
+                    self.instrs.append({"valu": [
+                        (HASH_STAGES[2][0], v_tmp1, v_val_cur, v_hash2_const1),
+                        (HASH_STAGES[2][3], v_tmp2, v_val_cur, v_hash2_const2),
+                        ("+", v_idx_cur, v_idx_cur, v_one)
+                    ]})
+                    self.instrs.append({"valu": [(HASH_STAGES[2][2], v_val_cur, v_tmp1, v_tmp2)]})
+                    self.instrs.append({"valu": [
+                        (HASH_STAGES[3][0], v_tmp1, v_val_cur, v_hash3_const1),
+                        (HASH_STAGES[3][3], v_tmp2, v_val_cur, v_hash3_const2)
+                    ]})
 
                 # Remaining hash stages, no loads for overlap
                 self.instrs.append({"valu": [(HASH_STAGES[3][2], v_val_cur, v_tmp1, v_tmp2)]})
@@ -356,7 +419,21 @@ class KernelBuilder:
             last_buf = ((batch_size // VLEN) - 1) % 2
             v_idx_cur, v_val_cur, v_node_val_cur, tmp_addrs_cur = buffers[last_buf]
 
-            self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_node_val_cur)]})
+            if round == 0:
+                self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_forest_node_0)]})
+            elif round == 1:
+                self.instrs.append({"valu": [("&", v_tmp1, v_idx_cur, v_one)]})
+                self.instrs.append({"flow": [("vselect", v_tmp2, v_tmp1, v_forest_node_1, v_forest_node_2)]})
+                self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_tmp2)]})
+            elif round == 2:
+                self.instrs.append({"valu": [("&", v_tmp1, v_idx_cur, v_one)]})
+                self.instrs.append({"flow": [("vselect", v_tmp2, v_tmp1, v_forest_node_3, v_forest_node_4)]})
+                self.instrs.append({"flow": [("vselect", v_node_val_cur, v_tmp1, v_forest_node_5, v_forest_node_6)]})
+                self.instrs.append({"valu": [("<", v_tmp1, v_idx_cur, v_five)]})
+                self.instrs.append({"flow": [("vselect", v_tmp2, v_tmp1, v_tmp2, v_node_val_cur)]})
+                self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_tmp2)]})
+            else:
+                self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_node_val_cur)]})
 
             # Hash stages
             self.instrs.append({"valu": [
