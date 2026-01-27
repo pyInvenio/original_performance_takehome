@@ -320,16 +320,16 @@ class KernelBuilder:
                     self.instrs.append({"flow": [("vselect", v_tmp2, v_tmp1, v_tmp2, v_node_val_cur)]})
                     self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_tmp2)]})
                 else:
-                    self.instrs.append({"valu": [("^", v_val_cur, v_val_cur, v_node_val_cur)]})
-
-                self.instrs.append({
-                    "valu": [("multiply_add", v_val_cur, v_val_cur, v_mult0, v_hash0_const1)],
-                    "alu": [("+", tmp_addr_1, self.scratch["inp_indices_p"], next_offset_const),
-                            ("+", tmp_addr_2, self.scratch["inp_values_p"], next_offset_const)]})
+                    # round >= 3: Pack XOR with addr_calc
+                    self.instrs.append({
+                        "valu": [("^", v_val_cur, v_val_cur, v_node_val_cur)],
+                        "alu": [("+", tmp_addr_1, self.scratch["inp_indices_p"], next_offset_const),
+                                ("+", tmp_addr_2, self.scratch["inp_values_p"], next_offset_const)]})
 
                 if round >= 3:
-                    # vload early - needed for scattered addr calc
+                    # Pack multiply_add with vload
                     self.instrs.append({
+                        "valu": [("multiply_add", v_val_cur, v_val_cur, v_mult0, v_hash0_const1)],
                         "load": [("vload", v_idx_next, tmp_addr_1),
                                  ("vload", v_val_next, tmp_addr_2)]})
                     self.instrs.append({"valu": [
@@ -379,6 +379,10 @@ class KernelBuilder:
                     ]})
                 else:
                     # round < 3: no scattered loads, can delay vload
+                    self.instrs.append({
+                        "valu": [("multiply_add", v_val_cur, v_val_cur, v_mult0, v_hash0_const1)],
+                        "alu": [("+", tmp_addr_1, self.scratch["inp_indices_p"], next_offset_const),
+                                ("+", tmp_addr_2, self.scratch["inp_values_p"], next_offset_const)]})
                     self.instrs.append({"valu": [
                         (HASH_STAGES[1][0], v_tmp1, v_val_cur, v_hash1_const1),
                         (HASH_STAGES[1][3], v_tmp2, v_val_cur, v_hash1_const2)
