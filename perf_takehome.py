@@ -78,7 +78,12 @@ class KernelBuilder:
         """
         self.forest_height = forest_height
         n_batches = batch_size // VLEN
-        GROUP_SIZE = 6
+        GROUP_SIZE = 24  # Process batches in groups (limited by scratch space)
+
+        def emit_valu_chunked(ops):
+            """Emit VALU ops in chunks of 6 (max VALU slots)"""
+            for i in range(0, len(ops), 6):
+                self.instrs.append({"valu": ops[i:i+6]})
 
         # ===== ALLOCATE CONTEXTS =====
         contexts = []
@@ -186,6 +191,8 @@ class KernelBuilder:
 
             # Process rounds with cross-round pipelining for consecutive scattered rounds
             round_num = 0
+            # Track addr calc done from previous round (for pipelining)
+            prev_round_addr_done = None
             while round_num < rounds:
                 level = round_num % (forest_height + 1)
                 need_scattered = level >= 3
@@ -202,7 +209,6 @@ class KernelBuilder:
                     # Operations per batch: addr_calc -> 4 loads -> xor -> hash[0-5] -> idx_update -> overflow_check
 
                     # Track completion cycles (using arrays instead of object attributes)
-                    addr_done = [-1] * active
                     loads_done = [-1] * active
                     xor_done = [-1] * active
                     h1_final = [-1] * active
@@ -214,25 +220,55 @@ class KernelBuilder:
                     idx_update_done = [-1] * active
                     all_done = [False] * active
 
+                    # For cross-round pipelining: track next round's addr calc
+                    next_round_addr_done = [-1] * active if next_scattered else None
+                    next_round_addr_idx = 0
+
                     load_queue = []  # (batch, pair_idx)
                     cycle = 0
-                    next_addr = 0
+
+                    # Use pre-computed addr calc from previous round if available
+                    addr_done = [-1] * active
+                    addr_calc_queue = list(range(active))  # Batches needing addr calc
+                    if prev_round_addr_done is not None:
+                        # Mark pre-computed batches as done and queue their loads
+                        for g in range(active):
+                            if prev_round_addr_done[g] >= 0:
+                                addr_done[g] = -1  # "done before this round"
+                                for pair in range(4):
+                                    load_queue.append((g, pair))
+                                addr_calc_queue.remove(g)  # Don't need addr calc
+                        prev_round_addr_done = None
 
                     while not all(all_done):
                         instr = {}
                         valu_ops = []
 
                         # 1. Schedule addr calc (8 ALU ops) - one per cycle
-                        if next_addr < active:
-                            ctx = contexts[next_addr]
+                        # First priority: current round addr calc
+                        if addr_calc_queue:
+                            g = addr_calc_queue.pop(0)
+                            ctx = contexts[g]
                             instr["alu"] = [
                                 ("+", ctx["addrs"][i], self.scratch["forest_values_p"], ctx["idx"] + i)
                                 for i in range(8)
                             ]
-                            addr_done[next_addr] = cycle
+                            addr_done[g] = cycle
                             for pair in range(4):
-                                load_queue.append((next_addr, pair))
-                            next_addr += 1
+                                load_queue.append((g, pair))
+                        # Second priority: next round addr calc (during hash tail)
+                        elif next_scattered and next_round_addr_idx < active:
+                            # Find a batch whose idx is ready for next round
+                            for g in range(next_round_addr_idx, active):
+                                if idx_update_done[g] >= 0 and idx_update_done[g] < cycle:
+                                    ctx = contexts[g]
+                                    instr["alu"] = [
+                                        ("+", ctx["addrs"][i], self.scratch["forest_values_p"], ctx["idx"] + i)
+                                        for i in range(8)
+                                    ]
+                                    next_round_addr_done[g] = cycle
+                                    next_round_addr_idx = g + 1
+                                    break
 
                         # 2. Schedule loads (1 pair = 2 ops per cycle)
                         if load_queue:
@@ -365,15 +401,18 @@ class KernelBuilder:
                         if cycle > 200:
                             break
 
+                    # Pass pre-computed addr calc to next round
+                    prev_round_addr_done = next_round_addr_done
+
                     # Skip the separate hash section for scattered rounds
                     round_num += 1
                     continue
 
                 elif level == 0:
-                    self.instrs.append({"valu": [
+                    emit_valu_chunked([
                         ("^", contexts[g]["val"], contexts[g]["val"], v_forest_nodes[0])
                         for g in range(active)
-                    ]})
+                    ])
                 elif level == 1:
                     for g in range(active):
                         ctx = contexts[g]
@@ -394,17 +433,17 @@ class KernelBuilder:
                                                       ctx["tmp2"], ctx["node"])]})
                         self.instrs.append({"valu": [("^", ctx["val"], ctx["val"], ctx["tmp2"])]})
                 else:
-                    self.instrs.append({"valu": [
+                    emit_valu_chunked([
                         ("^", contexts[g]["val"], contexts[g]["val"], contexts[g]["node"])
                         for g in range(active)
-                    ]})
+                    ])
 
                 # Hash computation - pack parallel ops together
                 # Stage 0
-                self.instrs.append({"valu": [
+                emit_valu_chunked([
                     ("multiply_add", contexts[g]["val"], contexts[g]["val"], v_mult0, v_hash_const1[0])
                     for g in range(active)
-                ]})
+                ])
 
                 # Stage 1: pack ^ and >> together
                 ops1 = []
@@ -412,66 +451,62 @@ class KernelBuilder:
                     ops1.append((HASH_STAGES[1][0], contexts[g]["tmp1"], contexts[g]["val"], v_hash_const1[1]))
                     ops1.append((HASH_STAGES[1][3], contexts[g]["tmp2"], contexts[g]["val"], v_hash_const2[1]))
                 # Split into 6-op chunks
-                for i in range(0, len(ops1), 6):
-                    self.instrs.append({"valu": ops1[i:i+6]})
-                self.instrs.append({"valu": [
+                emit_valu_chunked(ops1)
+                emit_valu_chunked([
                     (HASH_STAGES[1][2], contexts[g]["val"], contexts[g]["tmp1"], contexts[g]["tmp2"])
                     for g in range(active)
-                ]})
+                ])
 
                 # Stage 2 + index update - pack together
                 ops2 = []
                 for g in range(active):
                     ops2.append(("multiply_add", contexts[g]["val"], contexts[g]["val"], v_mult2, v_hash_const1[2]))
                     ops2.append(("multiply_add", contexts[g]["idx"], contexts[g]["idx"], v_two, v_one))
-                for i in range(0, len(ops2), 6):
-                    self.instrs.append({"valu": ops2[i:i+6]})
+                emit_valu_chunked(ops2)
 
                 # Stage 3: pack + and << together
                 ops3 = []
                 for g in range(active):
                     ops3.append((HASH_STAGES[3][0], contexts[g]["tmp1"], contexts[g]["val"], v_hash_const1[3]))
                     ops3.append((HASH_STAGES[3][3], contexts[g]["tmp2"], contexts[g]["val"], v_hash_const2[3]))
-                for i in range(0, len(ops3), 6):
-                    self.instrs.append({"valu": ops3[i:i+6]})
-                self.instrs.append({"valu": [
+                emit_valu_chunked(ops3)
+                emit_valu_chunked([
                     (HASH_STAGES[3][2], contexts[g]["val"], contexts[g]["tmp1"], contexts[g]["tmp2"])
                     for g in range(active)
-                ]})
+                ])
 
                 # Stage 4
-                self.instrs.append({"valu": [
+                emit_valu_chunked([
                     ("multiply_add", contexts[g]["val"], contexts[g]["val"], v_mult4, v_hash_const1[4])
                     for g in range(active)
-                ]})
+                ])
 
                 # Stage 5: pack ^ and >> together
                 ops5 = []
                 for g in range(active):
                     ops5.append((HASH_STAGES[5][0], contexts[g]["tmp1"], contexts[g]["val"], v_hash_const1[5]))
                     ops5.append((HASH_STAGES[5][3], contexts[g]["tmp2"], contexts[g]["val"], v_hash_const2[5]))
-                for i in range(0, len(ops5), 6):
-                    self.instrs.append({"valu": ops5[i:i+6]})
-                self.instrs.append({"valu": [
+                emit_valu_chunked(ops5)
+                emit_valu_chunked([
                     (HASH_STAGES[5][2], contexts[g]["val"], contexts[g]["tmp1"], contexts[g]["tmp2"])
                     for g in range(active)
-                ]})
+                ])
 
                 # Index update
-                self.instrs.append({"valu": [
+                emit_valu_chunked([
                     ("&", contexts[g]["tmp1"], contexts[g]["val"], v_one)
                     for g in range(active)
-                ]})
-                self.instrs.append({"valu": [
+                ])
+                emit_valu_chunked([
                     ("+", contexts[g]["idx"], contexts[g]["idx"], contexts[g]["tmp1"])
                     for g in range(active)
-                ]})
+                ])
 
                 if need_overflow_check:
-                    self.instrs.append({"valu": [
+                    emit_valu_chunked([
                         ("<", contexts[g]["tmp1"], contexts[g]["idx"], v_n_nodes)
                         for g in range(active)
-                    ]})
+                    ])
                     for g in range(active):
                         self.instrs.append({"flow": [
                             ("vselect", contexts[g]["idx"], contexts[g]["tmp1"],
