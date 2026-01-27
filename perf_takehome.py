@@ -101,6 +101,8 @@ class KernelBuilder:
         Scalar implementation using only scalar ALU and load/store.
         """
 
+        self.forest_height = forest_height
+
         v_idx_a = self.alloc_scratch("v_idx_a", VLEN)
         v_val_a = self.alloc_scratch("v_val_a", VLEN)
         v_node_val_a = self.alloc_scratch("v_node_val_a", VLEN)
@@ -111,17 +113,12 @@ class KernelBuilder:
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
 
-        idx_base = self.alloc_scratch("idx_base")
-        val_base = self.alloc_scratch("val_base")
-
-        v_two = self.alloc_scratch("v_two", VLEN)
-        v_one = self.alloc_scratch("v_one", VLEN)
         v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
         v_five = self.alloc_scratch("v_five", VLEN)
 
         tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -140,6 +137,8 @@ class KernelBuilder:
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
+        two_const = self.scratch_const(2)
+        two_const = self.scratch_const(2)
         two_const = self.scratch_const(2)
         five_const = self.scratch_const(5)
 
@@ -273,12 +272,16 @@ class KernelBuilder:
                 ("load", v_node_val + 7, tmp_addrs[7]),
             ]})
 
+        # first batch
+        offset_const_0 = self.scratch_const(0)
+        v_idx_cur, v_val_cur, v_node_val_cur, tmp_addrs_cur = buffers[0]
+        do_address_calc(offset_const_0, tmp_addr_1, tmp_addr_2)
+        do_vloads(v_idx_cur, v_val_cur, tmp_addr_1, tmp_addr_2)
+
         for round in range(rounds):
-            offset_const_0 = self.scratch_const(0)
-            v_idx_cur, v_val_cur, v_node_val_cur, tmp_addrs_cur = buffers[0]
-            # first batch
-            do_address_calc(offset_const_0, tmp_addr_1, tmp_addr_2)
-            do_vloads(v_idx_cur, v_val_cur, tmp_addr_1, tmp_addr_2)
+            if round > 0:
+                v_idx_cur, v_val_cur, v_node_val_cur, tmp_addrs_cur = buffers[0]
+                do_vloads(v_idx_cur, v_val_cur, tmp_addr_1, tmp_addr_2)
             if round >= 3:
                 do_scattered_address_calc(v_idx_cur, tmp_addrs_cur)
                 do_scattered_loads(v_node_val_cur, tmp_addrs_cur)
@@ -323,11 +326,12 @@ class KernelBuilder:
                     "valu": [("multiply_add", v_val_cur, v_val_cur, v_mult0, v_hash0_const1)],
                     "alu": [("+", tmp_addr_1, self.scratch["inp_indices_p"], next_offset_const),
                             ("+", tmp_addr_2, self.scratch["inp_values_p"], next_offset_const)]})
-                self.instrs.append({
-                    "load": [("vload", v_idx_next, tmp_addr_1),
-                             ("vload", v_val_next, tmp_addr_2)]})
 
                 if round >= 3:
+                    # vload early - needed for scattered addr calc
+                    self.instrs.append({
+                        "load": [("vload", v_idx_next, tmp_addr_1),
+                                 ("vload", v_val_next, tmp_addr_2)]})
                     self.instrs.append({"valu": [
                         (HASH_STAGES[1][0], v_tmp1, v_val_cur, v_hash1_const1),
                         (HASH_STAGES[1][3], v_tmp2, v_val_cur, v_hash1_const2)
@@ -374,6 +378,7 @@ class KernelBuilder:
                         ("load", v_node_val_next + 7, tmp_addrs_next[7]),
                     ]})
                 else:
+                    # round < 3: no scattered loads, can delay vload
                     self.instrs.append({"valu": [
                         (HASH_STAGES[1][0], v_tmp1, v_val_cur, v_hash1_const1),
                         (HASH_STAGES[1][3], v_tmp2, v_val_cur, v_hash1_const2)
@@ -391,7 +396,10 @@ class KernelBuilder:
                         (HASH_STAGES[3][0], v_tmp1, v_val_cur, v_hash3_const1),
                         (HASH_STAGES[3][3], v_tmp2, v_val_cur, v_hash3_const2)
                     ]})
-                    self.instrs.append({"valu": [(HASH_STAGES[3][2], v_val_cur, v_tmp1, v_tmp2)]})
+                    # Hash stage 3b + vload (delayed for rounds 0-2)
+                    self.instrs.append({"valu": [(HASH_STAGES[3][2], v_val_cur, v_tmp1, v_tmp2)],
+                                        "load": [("vload", v_idx_next, tmp_addr_1),
+                                                 ("vload", v_val_next, tmp_addr_2)]})
                 # Hash stage 4
                 self.instrs.append({"valu": [("multiply_add", v_val_cur, v_val_cur, v_mult4, v_hash4_const1)]})
                 self.instrs.append({"valu": [
@@ -409,8 +417,16 @@ class KernelBuilder:
                 self.instrs.append({"flow": [("vselect", v_idx_cur, v_tmp1, v_idx_cur, v_zero)]})
 
                 # Store current batch
-                self.instrs.append({"store": [("vstore", tmp_addr_1, v_idx_cur),
-                                              ("vstore", tmp_addr_2, v_val_cur)]})
+                if round < rounds - 1:
+                    self.instrs.append({
+                        "store": [("vstore", tmp_addr_1, v_idx_cur),
+                                    ("vstore", tmp_addr_2, v_val_cur)],
+                        "alu": [("+", tmp_addr_1, self.scratch["inp_indices_p"], offset_const_0),
+                                ("+", tmp_addr_2, self.scratch["inp_values_p"],  offset_const_0)]
+                    })
+                else:
+                    self.instrs.append({"store": [("vstore", tmp_addr_1, v_idx_cur),
+                                            ("vstore", tmp_addr_2, v_val_cur)]})
 
             # last batch
             last_offset = batch_size - VLEN
@@ -464,8 +480,16 @@ class KernelBuilder:
             self.instrs.append({"valu": [("<", v_tmp1, v_idx_cur, v_n_nodes)]})
             self.instrs.append({"flow": [("vselect", v_idx_cur, v_tmp1, v_idx_cur, v_zero)]})
 
-            self.instrs.append({"store": [("vstore", tmp_addr_1, v_idx_cur),
-                                          ("vstore", tmp_addr_2, v_val_cur)]})
+            if round < rounds - 1:
+                self.instrs.append({
+                    "store": [("vstore", tmp_addr_1, v_idx_cur),
+                                ("vstore", tmp_addr_2, v_val_cur)],
+                    "alu": [("+", tmp_addr_1, self.scratch["inp_indices_p"], offset_const_0),
+                            ("+", tmp_addr_2, self.scratch["inp_values_p"],  offset_const_0)]
+                })
+            else:
+                self.instrs.append({"store": [("vstore", tmp_addr_1, v_idx_cur),
+                                        ("vstore", tmp_addr_2, v_val_cur)]})
 
         self.instrs.append({"flow": [("pause",)]})
 
