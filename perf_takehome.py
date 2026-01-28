@@ -816,4 +816,4 @@ def do_kernel_test(
 
 
 if __name__ == "__main__":
-    do_kernel_test(10, 16, 256)
+    do_kernel_test(10, 16, 256, trace=True)
