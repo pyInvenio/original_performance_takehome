@@ -475,43 +475,69 @@ class KernelBuilder:
             ("vbroadcast", self.v_forest_nodes[i], forest_cache + i) for i in range(6)
         ]})
 
+        # Reuse hash0_c1 (now dead) for c_8 = VLEN for incremental addressing
+        self.c_8 = hash_c1_addrs[0]
+        self.instrs.append({"load": [("const", self.c_8, VLEN)]})
+
 
     def _build_dag(self) -> DAG:
         """Build the operation DAG."""
         dag = DAG()
 
+        # Track address ops for incremental computation
+        prev_init_addr_ops = None
+        batch_final_ops = []  # (prev_end, batch) for stores
+
         for batch in range(self.n_batches):
-            load_end = self._build_init_load(dag, batch)
+            load_end, addr_ops = self._build_init_load(dag, batch, prev_init_addr_ops)
+            prev_init_addr_ops = addr_ops
             prev_end = load_end
             for rnd in range(self.rounds):
                 level = rnd % (self.forest_height + 1)
                 prev_end = self._build_round(dag, batch, rnd, level, prev_end)
-            self._build_store(dag, batch, prev_end)
+            batch_final_ops.append(prev_end)
 
-        # Batch staggering edges
-        init_ops = {op.batch: op for op in dag.ops.values() if op.stage == "INIT_ADDR_IDX"}
-        for b in range(1, self.n_batches):
-            if b in init_ops and b - 1 in init_ops:
-                dag.add_edge(init_ops[b - 1], init_ops[b])
+        # Build stores with incremental addressing
+        prev_store_addr_ops = None
+        for batch in range(self.n_batches):
+            prev_store_addr_ops = self._build_store(dag, batch, batch_final_ops[batch], prev_store_addr_ops)
 
         return dag
 
-    def _build_init_load(self, dag: DAG, batch: int) -> Op:
+    def _build_init_load(self, dag: DAG, batch: int, prev_addr_ops) -> tuple:
         ctx = self.contexts[batch]
-        offset = batch * VLEN
 
-        addr_idx = dag.add_op(
-            Resource.FLOW, 1, 1, "flow",
-            [("add_imm", ctx["tmp1"], self.scratch["inp_indices_p"], offset)],
-            batch, -1, "INIT_ADDR_IDX"
-        )
+        if batch == 0:
+            # First batch: use FLOW add_imm
+            addr_idx = dag.add_op(
+                Resource.FLOW, 1, 1, "flow",
+                [("add_imm", ctx["tmp1"], self.scratch["inp_indices_p"], 0)],
+                batch, -1, "INIT_ADDR_IDX"
+            )
+            addr_val = dag.add_op(
+                Resource.FLOW, 1, 1, "flow",
+                [("add_imm", ctx["tmp2"], self.scratch["inp_values_p"], 0)],
+                batch, -1, "INIT_ADDR_VAL"
+            )
+        else:
+            # Subsequent batches: use ALU to add VLEN to previous batch's address
+            prev_ctx = self.contexts[batch - 1]
+            prev_addr_idx, prev_addr_val = prev_addr_ops
 
-        addr_val = dag.add_op(
-            Resource.FLOW, 1, 1, "flow",
-            [("add_imm", ctx["tmp2"], self.scratch["inp_values_p"], offset)],
-            batch, -1, "INIT_ADDR_VAL"
-        )
-        dag.add_edge(addr_idx, addr_val)
+            # Both ALU ops can run in same cycle (12 slots available)
+            addr_idx = dag.add_op(
+                Resource.ALU, 1, 1, "alu",
+                [("+", ctx["tmp1"], prev_ctx["tmp1"], self.c_8)],
+                batch, -1, "INIT_ADDR_IDX"
+            )
+            dag.add_edge(prev_addr_idx, addr_idx)
+
+            addr_val = dag.add_op(
+                Resource.ALU, 1, 1, "alu",
+                [("+", ctx["tmp2"], prev_ctx["tmp2"], self.c_8)],
+                batch, -1, "INIT_ADDR_VAL"
+            )
+            dag.add_edge(prev_addr_val, addr_val)
 
         load_idx = dag.add_op(
             Resource.LOAD, 1, 2, "load",
@@ -527,7 +553,7 @@ class KernelBuilder:
         )
         dag.add_edge(addr_val, load_val)
 
-        return load_val
+        return load_val, (addr_idx, addr_val)
 
     def _build_round(self, dag: DAG, batch: int, rnd: int, level: int, prev_end: Op) -> Op:
         if level >= 3:
@@ -815,16 +841,42 @@ class KernelBuilder:
 
         return h5, h2i  # Return both h5 (hash result) and h2i (idx update)
 
-    def _build_store(self, dag: DAG, batch: int, prev_end: Op) -> Op:
+    def _build_store(self, dag: DAG, batch: int, prev_end: Op, prev_store_addr_ops) -> tuple:
         ctx = self.contexts[batch]
-        offset = batch * VLEN
 
-        addr_idx = dag.add_op(
-            Resource.FLOW, 1, 1, "flow",
-            [("add_imm", ctx["node"], self.scratch["inp_indices_p"], offset)],
-            batch, -2, "STORE_ADDR_IDX"
-        )
+        if batch == 0:
+            # First batch: use FLOW add_imm
+            addr_idx = dag.add_op(
+                Resource.FLOW, 1, 1, "flow",
+                [("add_imm", ctx["node"], self.scratch["inp_indices_p"], 0)],
+                batch, -2, "STORE_ADDR_IDX"
+            )
+            addr_val = dag.add_op(
+                Resource.FLOW, 1, 1, "flow",
+                [("add_imm", ctx["node"] + 1, self.scratch["inp_values_p"], 0)],
+                batch, -2, "STORE_ADDR_VAL"
+            )
+        else:
+            # Subsequent batches: use ALU to add VLEN
+            prev_ctx = self.contexts[batch - 1]
+            prev_addr_idx, prev_addr_val = prev_store_addr_ops
+
+            addr_idx = dag.add_op(
+                Resource.ALU, 1, 1, "alu",
+                [("+", ctx["node"], prev_ctx["node"], self.c_8)],
+                batch, -2, "STORE_ADDR_IDX"
+            )
+            dag.add_edge(prev_addr_idx, addr_idx)
+
+            addr_val = dag.add_op(
+                Resource.ALU, 1, 1, "alu",
+                [("+", ctx["node"] + 1, prev_ctx["node"] + 1, self.c_8)],
+                batch, -2, "STORE_ADDR_VAL"
+            )
+            dag.add_edge(prev_addr_val, addr_val)
+
         dag.add_edge(prev_end, addr_idx)
+        dag.add_edge(prev_end, addr_val)
 
         store_idx = dag.add_op(
             Resource.STORE, 1, 1, "store",
@@ -833,19 +885,14 @@ class KernelBuilder:
         )
         dag.add_edge(addr_idx, store_idx)
 
-        addr_val = dag.add_op(
-            Resource.FLOW, 1, 1, "flow",
-            [("add_imm", ctx["node"] + 1, self.scratch["inp_values_p"], offset)],
-            batch, -2, "STORE_ADDR_VAL"
-        )
-        dag.add_edge(store_idx, addr_val)
-
         store_val = dag.add_op(
             Resource.STORE, 1, 1, "store",
             [("vstore", ctx["node"] + 1, ctx["val"])],
             batch, -2, "STORE_VAL"
         )
         dag.add_edge(addr_val, store_val)
+
+        return (addr_idx, addr_val)
 
         return store_val
 
