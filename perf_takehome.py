@@ -77,11 +77,12 @@ class Op:
 
 
 class DAG:
-    def __init__(self):
+    def __init__(self, n_batches=32):
         self.ops: Dict[int, Op] = {}
         self.op_counter = 0
         self._topo_order = None
         self._analysis_done = False
+        self.n_batches = n_batches
 
     def add_op(self, resource: Resource, slots: int, latency: int,
                instr_type: str, instr_data: List[Tuple],
@@ -177,8 +178,8 @@ class PipelineScheduler:
         self.colors[cycle].append(op)
         self.color_usage[cycle][op.resource] += op.slots
 
-    def schedule(self, overlap_depth=6) -> int:
-        """Pipeline-tuned scheduling."""
+    def schedule(self, overlap_depth=6, trace_slots=False) -> int:
+        """Pipeline-tuned scheduling with tail optimization."""
         self.reset()
 
         def get_stage(round_num):
@@ -214,16 +215,16 @@ class PipelineScheduler:
                     continue
 
                 stage = get_stage(op.round)
-
                 can_enter = True
-                if op.batch >= overlap_depth and stage > 0:
-                    prior_batch = op.batch - overlap_depth
-                    if batch_stage_start[prior_batch][stage] > cycle:
-                        can_enter = False
 
                 if can_enter:
                     valu_boost = 1000 if op.resource == Resource.VALU else 0
-                    priority = (-valu_boost, stage, op.batch, op.round, op.slack, op.id)
+
+                    # For late rounds (14-15), prioritize round over batch to pack work tighter
+                    if op.round >= 14:
+                        priority = (-valu_boost, op.round, op.batch, stage, op.slack, op.id)
+                    else:
+                        priority = (-valu_boost, stage, op.batch, op.round, op.slack, op.id)
                     candidates.append((priority, op))
 
             candidates.sort(key=lambda x: x[0])
@@ -248,7 +249,45 @@ class PipelineScheduler:
 
             cycle += 1
 
-        return max(self.colors.keys()) + 1 if self.colors else 0
+        total_cycles = max(self.colors.keys()) + 1 if self.colors else 0
+
+        if trace_slots:
+            # Print detailed slot utilization
+            print("\n=== FLOW SLOT UTILIZATION ===")
+            flow_ops = []
+            for c in range(total_cycles):
+                flow_used = self.color_usage[c][Resource.FLOW]
+                ops_at_cycle = self.colors.get(c, [])
+
+                if flow_used > 0:
+                    flow_op = [op for op in ops_at_cycle if op.resource == Resource.FLOW]
+                    if flow_op:
+                        op = flow_op[0]
+                        flow_ops.append((c, op.batch, op.round, op.stage))
+
+            print(f"Total FLOW ops: {len(flow_ops)} out of {total_cycles} cycles")
+            print("FLOW ops by stage:")
+            from collections import Counter
+            stage_counts = Counter(op[3] for op in flow_ops)
+            for stage, count in sorted(stage_counts.items()):
+                print(f"  {stage}: {count}")
+
+            # Show FLOW gaps
+            print("\nFLOW-free gap regions (5+ consecutive cycles):")
+            gap_start = None
+            for c in range(total_cycles):
+                flow_used = self.color_usage[c][Resource.FLOW]
+                if flow_used == 0:
+                    if gap_start is None:
+                        gap_start = c
+                else:
+                    if gap_start is not None and c - gap_start >= 5:
+                        print(f"  Cycles {gap_start}-{c-1}: {c - gap_start} free FLOW slots")
+                    gap_start = None
+            if gap_start is not None and total_cycles - gap_start >= 5:
+                print(f"  Cycles {gap_start}-{total_cycles-1}: {total_cycles - gap_start} free FLOW slots")
+
+        return total_cycles
 
     def generate_instructions(self) -> List[Dict]:
         """Convert schedule to instruction list."""
@@ -377,7 +416,7 @@ class KernelBuilder:
         # ===== BUILD AND SCHEDULE DAG =====
         dag = self._build_dag()
         scheduler = PipelineScheduler(dag)
-        makespan = scheduler.schedule()
+        makespan = scheduler.schedule(overlap_depth=8, trace_slots=True)
 
         # Convert schedule to instructions
         dag_instrs = scheduler.generate_instructions()
@@ -482,7 +521,7 @@ class KernelBuilder:
 
     def _build_dag(self) -> DAG:
         """Build the operation DAG."""
-        dag = DAG()
+        dag = DAG(n_batches=self.n_batches)
 
         # Track address ops for incremental computation
         prev_init_addr_ops = None
@@ -614,7 +653,7 @@ class KernelBuilder:
         dag.add_edge(idx_and, idx_add)
         dag.add_edge(h2i, idx_add)  # idx_add must wait for h2i (both modify idx)
 
-        # Overflow check at top level
+        # Overflow check at top level - use vselect for efficiency
         if level == self.forest_height:
             ovf_lt = dag.add_op(
                 Resource.VALU, 1, 1, "valu",
@@ -623,20 +662,14 @@ class KernelBuilder:
             )
             dag.add_edge(idx_add, ovf_lt)
 
-            ovf_neg = dag.add_op(
-                Resource.VALU, 1, 1, "valu",
-                [("-", ctx["tmp2"], self.v_zero, ctx["tmp1"])],
-                batch, rnd, "OVF_NEG"
+            # Use vselect: if idx < n_nodes, keep idx; else 0
+            ovf_sel = dag.add_op(
+                Resource.FLOW, 1, 1, "flow",
+                [("vselect", ctx["idx"], ctx["tmp1"], ctx["idx"], self.v_zero)],
+                batch, rnd, "OVF_SEL"
             )
-            dag.add_edge(ovf_lt, ovf_neg)
-
-            ovf_and = dag.add_op(
-                Resource.VALU, 1, 1, "valu",
-                [("&", ctx["idx"], ctx["idx"], ctx["tmp2"])],
-                batch, rnd, "OVF_AND"
-            )
-            dag.add_edge(ovf_neg, ovf_and)
-            return ovf_and
+            dag.add_edge(ovf_lt, ovf_sel)
+            return ovf_sel
 
         return idx_add
 
@@ -786,7 +819,8 @@ class KernelBuilder:
             [("multiply_add", ctx["idx"], ctx["idx"], self.v_two, self.v_one)],
             batch, rnd, "H2I"
         )
-        dag.add_edge(h1, h2i)
+        # H2I only reads idx, not val - can start earlier
+        dag.add_edge(prev, h2i)
 
         h3a = dag.add_op(
             Resource.VALU, 1, 1, "valu",
@@ -843,6 +877,7 @@ class KernelBuilder:
 
     def _build_store(self, dag: DAG, batch: int, prev_end: Op, prev_store_addr_ops) -> tuple:
         ctx = self.contexts[batch]
+        offset = batch * VLEN
 
         if batch == 0:
             # First batch: use FLOW add_imm
@@ -856,16 +891,20 @@ class KernelBuilder:
                 [("add_imm", ctx["node"] + 1, self.scratch["inp_values_p"], 0)],
                 batch, -2, "STORE_ADDR_VAL"
             )
+            dag.add_edge(prev_end, addr_idx)
+            dag.add_edge(prev_end, addr_val)
         else:
-            # Subsequent batches: use ALU to add VLEN
+            # Subsequent batches: use ALU to add VLEN to previous batch's address
             prev_ctx = self.contexts[batch - 1]
             prev_addr_idx, prev_addr_val = prev_store_addr_ops
 
+            # Both ALU ops can run in same cycle (12 slots available)
             addr_idx = dag.add_op(
                 Resource.ALU, 1, 1, "alu",
                 [("+", ctx["node"], prev_ctx["node"], self.c_8)],
                 batch, -2, "STORE_ADDR_IDX"
             )
+            dag.add_edge(prev_end, addr_idx)
             dag.add_edge(prev_addr_idx, addr_idx)
 
             addr_val = dag.add_op(
@@ -873,10 +912,8 @@ class KernelBuilder:
                 [("+", ctx["node"] + 1, prev_ctx["node"] + 1, self.c_8)],
                 batch, -2, "STORE_ADDR_VAL"
             )
+            dag.add_edge(prev_end, addr_val)
             dag.add_edge(prev_addr_val, addr_val)
-
-        dag.add_edge(prev_end, addr_idx)
-        dag.add_edge(prev_end, addr_val)
 
         store_idx = dag.add_op(
             Resource.STORE, 1, 1, "store",
@@ -893,8 +930,6 @@ class KernelBuilder:
         dag.add_edge(addr_val, store_val)
 
         return (addr_idx, addr_val)
-
-        return store_val
 
 
 # ============================================================================
