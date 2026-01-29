@@ -110,8 +110,7 @@ class KernelBuilder:
             ("vbroadcast", v_five, const_addrs[5]),
             ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]),
         ]})
-
-        self.instrs.append({"flow": [("pause",)]})
+        # Removed pause - hash constant loads are independent
 
         # ===== HASH CONSTANTS =====
         v_hash_const1 = [self.alloc_vec(f"v_hash{i}_const1") for i in range(6)]
@@ -142,22 +141,53 @@ class KernelBuilder:
         v_forest_nodes = [self.alloc_vec(f"v_forest_node_{i}") for i in range(7)]
         forest_cache = self.alloc_scratch("forest_cache", 8)
 
-        # Load hash constants and mult constants
+        # Load hash constants and mult constants, overlapping with vbroadcasts
         all_addrs = hash_c1_addrs + hash_c2_addrs + mult_addrs + [tmp1]
-        for i in range(0, len(all_addrs), 2):
-            loads = [("const", all_addrs[i], all_const_vals[i])]
-            if i + 1 < len(all_addrs):
-                loads.append(("const", all_addrs[i + 1], all_const_vals[i + 1]))
-            else:
-                loads.append(("vload", forest_cache, self.scratch["forest_values_p"]))
-            self.instrs.append({"load": loads})
-
-        self.instrs.append({"valu": [
-            ("vbroadcast", v_hash_const1[i], hash_c1_addrs[i]) for i in range(6)
-        ]})
-        self.instrs.append({"valu": [
-            ("vbroadcast", v_hash_const2[i], hash_c2_addrs[i]) for i in range(6)
-        ]})
+        # First 6 loads (hash_c1): just loads
+        for i in range(0, 6, 2):
+            self.instrs.append({"load": [
+                ("const", all_addrs[i], all_const_vals[i]),
+                ("const", all_addrs[i + 1], all_const_vals[i + 1])
+            ]})
+        # Load 6-11 (hash_c2) with vbroadcast of hash_c1 (loaded 2 cycles ago)
+        for i in range(6, 12, 2):
+            self.instrs.append({
+                "load": [
+                    ("const", all_addrs[i], all_const_vals[i]),
+                    ("const", all_addrs[i + 1], all_const_vals[i + 1])
+                ],
+                "valu": [
+                    ("vbroadcast", v_hash_const1[i - 6], hash_c1_addrs[i - 6]),
+                    ("vbroadcast", v_hash_const1[i - 5], hash_c1_addrs[i - 5])
+                ]
+            })
+        # Load 12-13 (mult_0, mult_1) with vbroadcast of hash_c2 + hash_c1[4,5]
+        self.instrs.append({
+            "load": [
+                ("const", mult_addrs[0], all_const_vals[12]),
+                ("const", mult_addrs[1], all_const_vals[13])
+            ],
+            "valu": [
+                ("vbroadcast", v_hash_const2[0], hash_c2_addrs[0]),
+                ("vbroadcast", v_hash_const2[1], hash_c2_addrs[1]),
+                ("vbroadcast", v_hash_const1[4], hash_c1_addrs[4]),
+                ("vbroadcast", v_hash_const1[5], hash_c1_addrs[5])
+            ]
+        })
+        # Load 14 (mult_2) + vload forest_cache, with vbroadcast hash_c2[2,3,4,5]
+        self.instrs.append({
+            "load": [
+                ("const", tmp1, all_const_vals[14]),
+                ("vload", forest_cache, self.scratch["forest_values_p"])
+            ],
+            "valu": [
+                ("vbroadcast", v_hash_const2[2], hash_c2_addrs[2]),
+                ("vbroadcast", v_hash_const2[3], hash_c2_addrs[3]),
+                ("vbroadcast", v_hash_const2[4], hash_c2_addrs[4]),
+                ("vbroadcast", v_hash_const2[5], hash_c2_addrs[5])
+            ]
+        })
+        # Broadcast mult and forest nodes
         self.instrs.append({"valu": [
             ("vbroadcast", v_mult0, mult_addrs[0]),
             ("vbroadcast", v_mult2, mult_addrs[1]),
@@ -204,7 +234,8 @@ class KernelBuilder:
         STAGE_IDX_AND = 15
         STAGE_IDX_ADD = 16
         STAGE_OVF_LT = 17
-        STAGE_OVF_SEL = 18
+        STAGE_OVF_NEG = 42  # New: negate comparison result to make mask
+        STAGE_OVF_AND = 18  # Renamed: apply mask with AND
         STAGE_AND1 = 20
         STAGE_VSEL1 = 21
         STAGE_LT = 22
@@ -291,32 +322,50 @@ class KernelBuilder:
                     break
 
             # ===== STORES FOR COMPLETED BATCHES =====
+            # Use node[0] and node[1] for store addresses (node is free after processing)
+            # This allows computing addresses while other batches still process
+
+            # First pass: S2 (val store) for multiple batches
+            for g in range(active):
+                if len(store_ops) >= 2:
+                    break
+                if not batch_done[g] or batch_stored[g]:
+                    continue
+                if batch_store_stage[g] == STORE_STAGE_VAL:
+                    ctx = contexts[g]
+                    store_ops.append(("vstore", ctx["node"] + 1, ctx["val"]))  # node[1] has val addr
+                    batch_store_stage[g] = STORE_STAGE_DONE
+                    batch_stored[g] = True
+
+            # Second pass: S1 (idx store + val addr) or S0 (idx addr)
+            # Try S1 first, if can't do it, try S0 for any batch
+            s1_candidate = -1
+            s0_candidate = -1
             for g in range(active):
                 if not batch_done[g] or batch_stored[g]:
                     continue
+                if batch_store_stage[g] == STORE_STAGE_IDX_ADDR_VAL and s1_candidate < 0:
+                    s1_candidate = g
+                elif batch_store_stage[g] == STORE_STAGE_ADDR_IDX and s0_candidate < 0:
+                    s0_candidate = g
+                if s1_candidate >= 0 and s0_candidate >= 0:
+                    break
 
+            # Try S1 first (uses flow + store)
+            if s1_candidate >= 0 and len(flow_ops) == 0 and len(store_ops) < 2:
+                g = s1_candidate
                 ctx = contexts[g]
                 offset = g * VLEN
-
-                if batch_store_stage[g] == STORE_STAGE_ADDR_IDX:
-                    if len(flow_ops) == 0:
-                        flow_ops.append(("add_imm", ctx["tmp1"], self.scratch["inp_indices_p"], offset))
-                        batch_store_stage[g] = STORE_STAGE_IDX_ADDR_VAL
-                    break
-
-                elif batch_store_stage[g] == STORE_STAGE_IDX_ADDR_VAL:
-                    if len(flow_ops) == 0 and len(store_ops) == 0:
-                        flow_ops.append(("add_imm", ctx["tmp2"], self.scratch["inp_values_p"], offset))
-                        store_ops.append(("vstore", ctx["tmp1"], ctx["idx"]))
-                        batch_store_stage[g] = STORE_STAGE_VAL
-                    break
-
-                elif batch_store_stage[g] == STORE_STAGE_VAL:
-                    if len(store_ops) == 0:
-                        store_ops.append(("vstore", ctx["tmp2"], ctx["val"]))
-                        batch_store_stage[g] = STORE_STAGE_DONE
-                        batch_stored[g] = True
-                    break
+                flow_ops.append(("add_imm", ctx["node"] + 1, self.scratch["inp_values_p"], offset))
+                store_ops.append(("vstore", ctx["node"], ctx["idx"]))
+                batch_store_stage[g] = STORE_STAGE_VAL
+            # If S1 couldn't be done, try S0 (uses flow only)
+            elif s0_candidate >= 0 and len(flow_ops) == 0:
+                g = s0_candidate
+                ctx = contexts[g]
+                offset = g * VLEN
+                flow_ops.append(("add_imm", ctx["node"], self.scratch["inp_indices_p"], offset))
+                batch_store_stage[g] = STORE_STAGE_IDX_ADDR_VAL
 
             # ===== PROCESS LOADED BATCHES =====
             for g in range(active):
@@ -461,7 +510,7 @@ class KernelBuilder:
                                 sd[STAGE_IDX_ADD] = cycle
                             continue
 
-                    # Overflow check
+                    # Overflow check (using VALU instead of flow vselect)
                     if overflow:
                         if sd[STAGE_IDX_ADD] >= 0 and sd[STAGE_IDX_ADD] < cycle:
                             if sd[STAGE_OVF_LT] < 0:
@@ -471,13 +520,22 @@ class KernelBuilder:
                                 continue
 
                         if sd[STAGE_OVF_LT] >= 0 and sd[STAGE_OVF_LT] < cycle:
-                            if sd[STAGE_OVF_SEL] < 0:
-                                if len(flow_ops) < 1:
-                                    flow_ops.append(("vselect", ctx["idx"], ctx["tmp1"], ctx["idx"], v_zero))
-                                    sd[STAGE_OVF_SEL] = cycle
+                            if sd[STAGE_OVF_NEG] < 0:
+                                if len(valu_ops) < 6:
+                                    # tmp2 = 0 - tmp1 = -tmp1 (creates mask: 0xFFFFFFFF if tmp1=1, 0 if tmp1=0)
+                                    valu_ops.append(("-", ctx["tmp2"], v_zero, ctx["tmp1"]))
+                                    sd[STAGE_OVF_NEG] = cycle
                                 continue
 
-                        if sd[STAGE_OVF_SEL] >= 0 and sd[STAGE_OVF_SEL] < cycle:
+                        if sd[STAGE_OVF_NEG] >= 0 and sd[STAGE_OVF_NEG] < cycle:
+                            if sd[STAGE_OVF_AND] < 0:
+                                if len(valu_ops) < 6:
+                                    # idx = idx & tmp2 (zeros out idx where tmp1 was 0)
+                                    valu_ops.append(("&", ctx["idx"], ctx["idx"], ctx["tmp2"]))
+                                    sd[STAGE_OVF_AND] = cycle
+                                continue
+
+                        if sd[STAGE_OVF_AND] >= 0 and sd[STAGE_OVF_AND] < cycle:
                             current_round[g] += 1
                             if current_round[g] < tile_end:
                                 for s in range(50):
@@ -737,4 +795,4 @@ def do_kernel_test(forest_height: int, rounds: int, batch_size: int, seed: int =
 
 
 if __name__ == "__main__":
-    do_kernel_test(10, 16, 256, trace=False)
+    do_kernel_test(10, 16, 256, trace=True)
