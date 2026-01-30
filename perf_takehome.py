@@ -62,12 +62,11 @@ class Op:
 
 
 class DAG:
-    def __init__(self, n_batches=32):
+    def __init__(self):
         self.ops: Dict[int, Op] = {}
         self.op_counter = 0
         self._topo_order = None
         self._analysis_done = False
-        self.n_batches = n_batches
 
     def add_op(self, resource: Resource, slots: int, latency: int,
                instr_type: str, instr_data: List[Tuple],
@@ -127,116 +126,6 @@ class DAG:
         self._analysis_done = True
 
 
-class PipelineScheduler:
-    def __init__(self, dag: DAG):
-        self.dag = dag
-        self.dag.analyze()
-        self.colors: Dict[int, List[Op]] = defaultdict(list)
-        self.color_usage: Dict[int, Dict[Resource, int]] = defaultdict(lambda: defaultdict(int))
-
-    def reset(self):
-        self.colors.clear()
-        self.color_usage.clear()
-        for op in self.dag.ops.values():
-            op.color = -1
-
-    def can_schedule(self, op: Op, cycle: int) -> bool:
-        for pred in op.preds:
-            if pred.color < 0 or cycle < pred.color + pred.latency:
-                return False
-        if self.color_usage[cycle][op.resource] + op.slots > LIMITS[op.resource]:
-            return False
-        return True
-
-    def schedule_op(self, op: Op, cycle: int):
-        op.color = cycle
-        self.colors[cycle].append(op)
-        self.color_usage[cycle][op.resource] += op.slots
-
-    def _get_stage(self, round_num):
-        if round_num == -1:
-            return 0
-        elif round_num == -2:
-            return 4
-        elif round_num <= 5:
-            return 1
-        elif round_num <= 10:
-            return 2
-        else:
-            return 3
-
-    def schedule(self) -> int:
-        self.reset()
-        batch_stage_start = defaultdict(lambda: defaultdict(lambda: float('inf')))
-        ready = set()
-        scheduled = set()
-        for op in self.dag.ops.values():
-            if not op.preds:
-                ready.add(op.id)
-        cycle = 0
-        max_cycles = 10000
-
-        while len(scheduled) < len(self.dag.ops) and cycle < max_cycles:
-            candidates = []
-            for op_id in ready:
-                op = self.dag.ops[op_id]
-                if not self.can_schedule(op, cycle):
-                    continue
-                stage = self._get_stage(op.round)
-                valu_boost = 1000 if op.resource == Resource.VALU else 0
-                batch_group = op.batch // 6 if op.batch >= 0 else -1
-                batch_in_group = op.batch % 6 if op.batch >= 0 else 0
-                if op.round >= 14:
-                    priority = (-valu_boost, op.round, batch_group, batch_in_group, stage, op.slack, op.id)
-                else:
-                    priority = (-valu_boost, stage, batch_group, batch_in_group, op.round, op.slack, op.id)
-                candidates.append((priority, op))
-
-            candidates.sort(key=lambda x: x[0])
-            for _, op in candidates:
-                if op.id in scheduled:
-                    continue
-                if self.can_schedule(op, cycle):
-                    self.schedule_op(op, cycle)
-                    scheduled.add(op.id)
-                    ready.discard(op.id)
-                    stage = self._get_stage(op.round)
-                    batch_stage_start[op.batch][stage] = min(batch_stage_start[op.batch][stage], cycle)
-                    for succ in op.succs:
-                        if succ.id not in scheduled and succ.id not in ready:
-                            if all(p.color >= 0 for p in succ.preds):
-                                ready.add(succ.id)
-            cycle += 1
-
-        return max(self.colors.keys()) + 1 if self.colors else 0
-
-    def generate_instructions(self) -> List[Dict]:
-        if not self.colors:
-            return []
-        max_color = max(self.colors.keys())
-        instructions = []
-        for color in range(max_color + 1):
-            instr = defaultdict(list)
-            for op in self.colors.get(color, []):
-                for data in op.instr_data:
-                    instr[op.instr_type].append(data)
-            cycle_instr = {}
-            if instr["valu"]:
-                cycle_instr["valu"] = instr["valu"][:6]
-            if instr["alu"]:
-                cycle_instr["alu"] = instr["alu"][:12]
-            if instr["load"]:
-                cycle_instr["load"] = instr["load"][:2]
-            if instr["store"]:
-                cycle_instr["store"] = instr["store"][:2]
-            if instr["flow"]:
-                cycle_instr["flow"] = instr["flow"][:1]
-            instructions.append(cycle_instr)
-        while instructions and not instructions[-1]:
-            instructions.pop()
-        return instructions
-
-
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -260,20 +149,21 @@ class KernelBuilder:
         return self.alloc_scratch(name, VLEN)
 
     def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
-        self.forest_height = forest_height
-        self.rounds = rounds
-        self.n_batches = batch_size // VLEN
-        self._alloc_memory()
-        self._build_init()
-        dag = self._build_dag()
-        scheduler = PipelineScheduler(dag)
-        scheduler.schedule()
-        self.instrs.extend(scheduler.generate_instructions())
-        self.instrs.append({"flow": [("pause",)]})
+        n_batches = batch_size // VLEN
+        n_levels = forest_height + 1
 
-    def _alloc_memory(self):
-        self.contexts = []
-        for g in range(self.n_batches):
+        # Calculate tree structure
+        # Level L has nodes from index (2^L - 1) to (2^(L+1) - 2)
+        # Levels 0, 1, 2 can use cached nodes (7 total: 0, 1-2, 3-6)
+        # Levels 3+ require scattered loads
+        max_cached_level = min(2, forest_height)
+        n_cached_nodes = (1 << (max_cached_level + 1)) - 1  # 2^(L+1) - 1
+        # At level 2, indices are 3,4,5,6. We use idx < 5 to select 3,4 vs 5,6
+        level_2_threshold = 5
+
+        # Allocate contexts for each batch
+        contexts = []
+        for g in range(n_batches):
             ctx = {
                 "idx": self.alloc_vec(f"ctx{g}_idx"),
                 "val": self.alloc_vec(f"ctx{g}_val"),
@@ -282,60 +172,65 @@ class KernelBuilder:
                 "tmp2": self.alloc_vec(f"ctx{g}_tmp2"),
             }
             ctx["addr"] = ctx["tmp1"]
-            self.contexts.append(ctx)
+            contexts.append(ctx)
 
-        self.v_zero = self.alloc_vec("v_zero")
-        self.v_one = self.alloc_vec("v_one")
-        self.v_two = self.alloc_vec("v_two")
-        self.v_five = self.alloc_vec("v_five")
-        self.v_n_nodes = self.alloc_vec("v_n_nodes")
-        self.v_forest_base = self.alloc_vec("v_forest_base")
-        self.v_hash_const1 = [self.alloc_vec(f"v_hash{i}_const1") for i in range(6)]
-        self.v_hash_const2 = [self.alloc_vec(f"v_hash{i}_const2") for i in range(6)]
-        self.v_mult0 = self.alloc_vec("v_mult0")
-        self.v_mult2 = self.alloc_vec("v_mult2")
-        self.v_mult4 = self.alloc_vec("v_mult4")
-        self.v_forest_nodes = [self.alloc_vec(f"v_forest_node_{i}") for i in range(7)]
+        # Vector constants
+        v_zero = self.alloc_vec("v_zero")
+        v_one = self.alloc_vec("v_one")
+        v_two = self.alloc_vec("v_two")
+        v_threshold = self.alloc_vec("v_threshold")  # For level 2 comparison
+        v_n_nodes = self.alloc_vec("v_n_nodes")
+        v_forest_base = self.alloc_vec("v_forest_base")
+        v_hash_const1 = [self.alloc_vec(f"v_hash{i}_const1") for i in range(6)]
+        v_hash_const2 = [self.alloc_vec(f"v_hash{i}_const2") for i in range(6)]
+        v_mult0 = self.alloc_vec("v_mult0")
+        v_mult2 = self.alloc_vec("v_mult2")
+        v_mult4 = self.alloc_vec("v_mult4")
+        v_forest_nodes = [self.alloc_vec(f"v_forest_node_{i}") for i in range(n_cached_nodes)]
 
-        self.tmp1 = self.alloc_scratch("tmp1")
-        self.tmp2 = self.alloc_scratch("tmp2")
+        # Scalar temps and constants
+        tmp1 = self.alloc_scratch("tmp1")
+        tmp2 = self.alloc_scratch("tmp2")
         self.alloc_scratch("n_nodes")
         self.alloc_scratch("forest_values_p")
         self.alloc_scratch("inp_indices_p")
         self.alloc_scratch("inp_values_p")
-        for val in [0, 1, 2, 5]:
-            self.alloc_scratch(f"c_{val}")
-        for i in range(6):
-            self.alloc_scratch(f"hash{i}_c1")
-            self.alloc_scratch(f"hash{i}_c2")
-        self.alloc_scratch("mult_0")
-        self.alloc_scratch("mult_1")
-        self.alloc_scratch("forest_cache", 8)
+        c_0 = self.alloc_scratch("c_0")
+        c_1 = self.alloc_scratch("c_1")
+        c_2 = self.alloc_scratch("c_2")
+        c_threshold = self.alloc_scratch("c_threshold")
+        hash_c1_addrs = [self.alloc_scratch(f"hash{i}_c1") for i in range(6)]
+        hash_c2_addrs = [self.alloc_scratch(f"hash{i}_c2") for i in range(6)]
+        mult_addrs = [self.alloc_scratch("mult_0"), self.alloc_scratch("mult_1")]
+        forest_cache = self.alloc_scratch("forest_cache", max(8, n_cached_nodes))
 
-    def _build_init(self):
-        self.instrs.append({"load": [("const", self.tmp1, 1), ("const", self.tmp2, 4)]})
-        self.instrs.append({"load": [("load", self.scratch["n_nodes"], self.tmp1),
-                                      ("load", self.scratch["forest_values_p"], self.tmp2)]})
-        self.instrs.append({"load": [("const", self.tmp1, 5), ("const", self.tmp2, 6)]})
-        self.instrs.append({"load": [("load", self.scratch["inp_indices_p"], self.tmp1),
-                                      ("load", self.scratch["inp_values_p"], self.tmp2)]})
-        self.instrs.append({"load": [("const", self.scratch["c_0"], 0), ("const", self.scratch["c_1"], 1)]})
-        self.instrs.append({"load": [("const", self.scratch["c_2"], 2), ("const", self.scratch["c_5"], 5)]})
+        # === BUILD INIT INSTRUCTIONS ===
+        # Load pointers from memory header
+        self.instrs.append({"load": [("const", tmp1, 1), ("const", tmp2, 4)]})
+        self.instrs.append({"load": [("load", self.scratch["n_nodes"], tmp1),
+                                      ("load", self.scratch["forest_values_p"], tmp2)]})
+        self.instrs.append({"load": [("const", tmp1, 5), ("const", tmp2, 6)]})
+        self.instrs.append({"load": [("load", self.scratch["inp_indices_p"], tmp1),
+                                      ("load", self.scratch["inp_values_p"], tmp2)]})
+
+        # Load scalar constants
+        self.instrs.append({"load": [("const", c_0, 0), ("const", c_1, 1)]})
+        self.instrs.append({"load": [("const", c_2, 2), ("const", c_threshold, level_2_threshold)]})
+
+        # Broadcast basic vector constants
         self.instrs.append({"valu": [
-            ("vbroadcast", self.v_two, self.scratch["c_2"]),
-            ("vbroadcast", self.v_one, self.scratch["c_1"]),
-            ("vbroadcast", self.v_zero, self.scratch["c_0"]),
-            ("vbroadcast", self.v_n_nodes, self.scratch["n_nodes"]),
-            ("vbroadcast", self.v_five, self.scratch["c_5"]),
-            ("vbroadcast", self.v_forest_base, self.scratch["forest_values_p"]),
+            ("vbroadcast", v_two, c_2),
+            ("vbroadcast", v_one, c_1),
+            ("vbroadcast", v_zero, c_0),
+            ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+            ("vbroadcast", v_threshold, c_threshold),
+            ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]),
         ]})
 
+        # Hash constants
         hash_const1_vals = [HASH_STAGES[i][1] for i in range(6)]
         hash_const2_vals = [HASH_STAGES[i][4] for i in range(6)]
         mult_vals = [1 + (1 << 12), 1 + (1 << 5), 1 + (1 << 3)]
-        hash_c1_addrs = [self.scratch[f"hash{i}_c1"] for i in range(6)]
-        hash_c2_addrs = [self.scratch[f"hash{i}_c2"] for i in range(6)]
-        mult_addrs = [self.scratch["mult_0"], self.scratch["mult_1"]]
 
         for i in range(0, 6, 2):
             self.instrs.append({"load": [
@@ -349,8 +244,8 @@ class KernelBuilder:
                     ("const", hash_c2_addrs[i + 1], hash_const2_vals[i + 1])
                 ],
                 "valu": [
-                    ("vbroadcast", self.v_hash_const1[i], hash_c1_addrs[i]),
-                    ("vbroadcast", self.v_hash_const1[i + 1], hash_c1_addrs[i + 1])
+                    ("vbroadcast", v_hash_const1[i], hash_c1_addrs[i]),
+                    ("vbroadcast", v_hash_const1[i + 1], hash_c1_addrs[i + 1])
                 ]
             })
         self.instrs.append({
@@ -359,412 +254,413 @@ class KernelBuilder:
                 ("const", mult_addrs[1], mult_vals[1])
             ],
             "valu": [
-                ("vbroadcast", self.v_hash_const2[0], hash_c2_addrs[0]),
-                ("vbroadcast", self.v_hash_const2[1], hash_c2_addrs[1]),
-                ("vbroadcast", self.v_hash_const2[2], hash_c2_addrs[2]),
-                ("vbroadcast", self.v_hash_const2[3], hash_c2_addrs[3]),
+                ("vbroadcast", v_hash_const2[0], hash_c2_addrs[0]),
+                ("vbroadcast", v_hash_const2[1], hash_c2_addrs[1]),
+                ("vbroadcast", v_hash_const2[2], hash_c2_addrs[2]),
+                ("vbroadcast", v_hash_const2[3], hash_c2_addrs[3]),
             ]
         })
-        forest_cache = self.scratch["forest_cache"]
         self.instrs.append({
             "load": [
-                ("const", self.tmp1, mult_vals[2]),
+                ("const", tmp1, mult_vals[2]),
                 ("vload", forest_cache, self.scratch["forest_values_p"])
             ],
             "valu": [
-                ("vbroadcast", self.v_hash_const2[4], hash_c2_addrs[4]),
-                ("vbroadcast", self.v_hash_const2[5], hash_c2_addrs[5]),
+                ("vbroadcast", v_hash_const2[4], hash_c2_addrs[4]),
+                ("vbroadcast", v_hash_const2[5], hash_c2_addrs[5]),
             ]
         })
-        self.instrs.append({"valu": [
-            ("vbroadcast", self.v_mult0, mult_addrs[0]),
-            ("vbroadcast", self.v_mult2, mult_addrs[1]),
-            ("vbroadcast", self.v_mult4, self.tmp1),
-            ("vbroadcast", self.v_forest_nodes[6], forest_cache + 6),
-        ]})
-        self.instrs.append({"valu": [
-            ("vbroadcast", self.v_forest_nodes[i], forest_cache + i) for i in range(6)
-        ]})
-        self.c_8 = hash_c1_addrs[0]
-        self.instrs.append({"load": [("const", self.c_8, VLEN)]})
 
-    def _build_dag(self) -> DAG:
-        dag = DAG(n_batches=self.n_batches)
+        # Broadcast mult constants and forest nodes
+        self.instrs.append({"valu": [
+            ("vbroadcast", v_mult0, mult_addrs[0]),
+            ("vbroadcast", v_mult2, mult_addrs[1]),
+            ("vbroadcast", v_mult4, tmp1),
+            ("vbroadcast", v_forest_nodes[n_cached_nodes - 1], forest_cache + n_cached_nodes - 1),
+        ]})
+        self.instrs.append({"valu": [
+            ("vbroadcast", v_forest_nodes[i], forest_cache + i) for i in range(min(6, n_cached_nodes - 1))
+        ]})
+
+        # Reuse hash0_c1 for c_8 (VLEN constant for incremental addressing)
+        c_8 = hash_c1_addrs[0]
+        self.instrs.append({"load": [("const", c_8, VLEN)]})
+
+        # === BUILD DAG ===
+        dag = DAG()
         prev_init_addr_ops = None
-        batch_final_ops = [None] * self.n_batches
+        batch_final_ops = [None] * n_batches
 
-        for batch in range(self.n_batches):
-            load_end, addr_ops = self._build_init_load(dag, batch, prev_init_addr_ops)
-            prev_init_addr_ops = addr_ops
+        def build_hash(batch: int, rnd: int, prev: Op) -> tuple:
+            ctx = contexts[batch]
+            h0 = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [("multiply_add", ctx["val"], ctx["val"], v_mult0, v_hash_const1[0])],
+                batch, rnd, "H0")
+            dag.add_edge(prev, h0)
+
+            h1a = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [(HASH_STAGES[1][0], ctx["tmp1"], ctx["val"], v_hash_const1[1])],
+                batch, rnd, "H1A")
+            dag.add_edge(h0, h1a)
+
+            h1b = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [(HASH_STAGES[1][3], ctx["tmp2"], ctx["val"], v_hash_const2[1])],
+                batch, rnd, "H1B")
+            dag.add_edge(h0, h1b)
+
+            h1 = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [(HASH_STAGES[1][2], ctx["val"], ctx["tmp1"], ctx["tmp2"])],
+                batch, rnd, "H1")
+            dag.add_edge(h1a, h1)
+            dag.add_edge(h1b, h1)
+
+            h2v = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [("multiply_add", ctx["val"], ctx["val"], v_mult2, v_hash_const1[2])],
+                batch, rnd, "H2V")
+            dag.add_edge(h1, h2v)
+
+            h2i = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [("multiply_add", ctx["idx"], ctx["idx"], v_two, v_one)],
+                batch, rnd, "H2I")
+            dag.add_edge(prev, h2i)
+
+            h3a = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [(HASH_STAGES[3][0], ctx["tmp1"], ctx["val"], v_hash_const1[3])],
+                batch, rnd, "H3A")
+            dag.add_edge(h2v, h3a)
+
+            h3b = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [(HASH_STAGES[3][3], ctx["tmp2"], ctx["val"], v_hash_const2[3])],
+                batch, rnd, "H3B")
+            dag.add_edge(h2v, h3b)
+
+            h3 = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [(HASH_STAGES[3][2], ctx["val"], ctx["tmp1"], ctx["tmp2"])],
+                batch, rnd, "H3")
+            dag.add_edge(h3a, h3)
+            dag.add_edge(h3b, h3)
+
+            h4 = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [("multiply_add", ctx["val"], ctx["val"], v_mult4, v_hash_const1[4])],
+                batch, rnd, "H4")
+            dag.add_edge(h3, h4)
+
+            h5a = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [(HASH_STAGES[5][0], ctx["tmp1"], ctx["val"], v_hash_const1[5])],
+                batch, rnd, "H5A")
+            dag.add_edge(h4, h5a)
+
+            h5b = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [(HASH_STAGES[5][3], ctx["tmp2"], ctx["val"], v_hash_const2[5])],
+                batch, rnd, "H5B")
+            dag.add_edge(h4, h5b)
+
+            h5 = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [(HASH_STAGES[5][2], ctx["val"], ctx["tmp1"], ctx["tmp2"])],
+                batch, rnd, "H5")
+            dag.add_edge(h5a, h5)
+            dag.add_edge(h5b, h5)
+
+            return h5, h2i
+
+        def build_scattered(batch: int, rnd: int, level: int, val_ready: Op, idx_ready: Op) -> tuple:
+            ctx = contexts[batch]
+            addr = dag.add_op(Resource.ALU, 8, 1, "alu",
+                [("+", ctx["addr"] + i, self.scratch["forest_values_p"], ctx["idx"] + i) for i in range(8)],
+                batch, rnd, "ADDR")
+            dag.add_edge(idx_ready, addr)
+
+            load_ops = []
+            for ld in range(4):
+                i = ld * 2
+                load_op = dag.add_op(Resource.LOAD, 2, 2, "load",
+                    [("load", ctx["node"] + i, ctx["addr"] + i),
+                     ("load", ctx["node"] + i + 1, ctx["addr"] + i + 1)],
+                    batch, rnd, f"LOAD{ld}")
+                dag.add_edge(addr, load_op)
+                load_ops.append(load_op)
+
+            xor = dag.add_op(Resource.ALU, 8, 1, "alu",
+                [("^", ctx["val"] + i, ctx["val"] + i, ctx["node"] + i) for i in range(8)],
+                batch, rnd, "XOR")
+            for load_op in load_ops:
+                dag.add_edge(load_op, xor)
+            dag.add_edge(val_ready, xor)
+
+            hash_end, h2i = build_hash(batch, rnd, xor)
+            dag.add_edge(idx_ready, h2i)
+
+            idx_and = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [("&", ctx["tmp1"], ctx["val"], v_one)],
+                batch, rnd, "IDX_AND")
+            dag.add_edge(hash_end, idx_and)
+
+            idx_add = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [("+", ctx["idx"], ctx["idx"], ctx["tmp1"])],
+                batch, rnd, "IDX_ADD")
+            dag.add_edge(idx_and, idx_add)
+            dag.add_edge(h2i, idx_add)
+
+            if level == forest_height:
+                ovf_lt = dag.add_op(Resource.VALU, 1, 1, "valu",
+                    [("<", ctx["tmp1"], ctx["idx"], v_n_nodes)],
+                    batch, rnd, "OVF_LT")
+                dag.add_edge(idx_add, ovf_lt)
+                ovf_sel = dag.add_op(Resource.FLOW, 1, 1, "flow",
+                    [("vselect", ctx["idx"], ctx["tmp1"], ctx["idx"], v_zero)],
+                    batch, rnd, "OVF_SEL")
+                dag.add_edge(ovf_lt, ovf_sel)
+                return ovf_sel, hash_end, ovf_sel
+            return idx_add, hash_end, idx_add
+
+        def build_non_scattered(batch: int, rnd: int, level: int, val_ready: Op, idx_ready: Op) -> tuple:
+            ctx = contexts[batch]
+            fn = v_forest_nodes
+
+            if level == 0:
+                xor = dag.add_op(Resource.ALU, 8, 1, "alu",
+                    [("^", ctx["val"] + i, ctx["val"] + i, fn[0] + i) for i in range(8)],
+                    batch, rnd, "XOR")
+                dag.add_edge(val_ready, xor)
+                xor_end = xor
+            elif level == 1:
+                and1 = dag.add_op(Resource.VALU, 1, 1, "valu",
+                    [("&", ctx["tmp1"], ctx["idx"], v_one)],
+                    batch, rnd, "AND1")
+                dag.add_edge(idx_ready, and1)
+                vsel1 = dag.add_op(Resource.FLOW, 1, 1, "flow",
+                    [("vselect", ctx["tmp2"], ctx["tmp1"], fn[1], fn[2])],
+                    batch, rnd, "VSEL1")
+                dag.add_edge(and1, vsel1)
+                xor = dag.add_op(Resource.ALU, 8, 1, "alu",
+                    [("^", ctx["val"] + i, ctx["val"] + i, ctx["tmp2"] + i) for i in range(8)],
+                    batch, rnd, "XOR")
+                dag.add_edge(vsel1, xor)
+                dag.add_edge(val_ready, xor)
+                xor_end = xor
+            else:  # level == 2
+                and1 = dag.add_op(Resource.VALU, 1, 1, "valu",
+                    [("&", ctx["tmp1"], ctx["idx"], v_one)],
+                    batch, rnd, "AND1")
+                dag.add_edge(idx_ready, and1)
+                vsel1 = dag.add_op(Resource.FLOW, 1, 1, "flow",
+                    [("vselect", ctx["tmp2"], ctx["tmp1"], fn[3], fn[4])],
+                    batch, rnd, "VSEL1")
+                dag.add_edge(and1, vsel1)
+                vsel2 = dag.add_op(Resource.FLOW, 1, 1, "flow",
+                    [("vselect", ctx["node"], ctx["tmp1"], fn[5], fn[6])],
+                    batch, rnd, "VSEL2")
+                dag.add_edge(vsel1, vsel2)
+                lt = dag.add_op(Resource.VALU, 1, 1, "valu",
+                    [("<", ctx["tmp1"], ctx["idx"], v_threshold)],
+                    batch, rnd, "LT")
+                dag.add_edge(vsel2, lt)
+                dag.add_edge(idx_ready, lt)
+                vsel3 = dag.add_op(Resource.FLOW, 1, 1, "flow",
+                    [("vselect", ctx["tmp2"], ctx["tmp1"], ctx["tmp2"], ctx["node"])],
+                    batch, rnd, "VSEL3")
+                dag.add_edge(lt, vsel3)
+                xor = dag.add_op(Resource.ALU, 8, 1, "alu",
+                    [("^", ctx["val"] + i, ctx["val"] + i, ctx["tmp2"] + i) for i in range(8)],
+                    batch, rnd, "XOR")
+                dag.add_edge(vsel3, xor)
+                dag.add_edge(val_ready, xor)
+                xor_end = xor
+
+            hash_end, h2i = build_hash(batch, rnd, xor_end)
+            dag.add_edge(idx_ready, h2i)
+
+            idx_and = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [("&", ctx["tmp1"], ctx["val"], v_one)],
+                batch, rnd, "IDX_AND")
+            dag.add_edge(hash_end, idx_and)
+            idx_add = dag.add_op(Resource.VALU, 1, 1, "valu",
+                [("+", ctx["idx"], ctx["idx"], ctx["tmp1"])],
+                batch, rnd, "IDX_ADD")
+            dag.add_edge(idx_and, idx_add)
+            dag.add_edge(h2i, idx_add)
+            return idx_add, hash_end, idx_add
+
+        # Build init loads for each batch
+        for batch in range(n_batches):
+            ctx = contexts[batch]
+            if batch == 0:
+                addr_idx = dag.add_op(Resource.FLOW, 1, 1, "flow",
+                    [("add_imm", ctx["tmp1"], self.scratch["inp_indices_p"], 0)],
+                    batch, -1, "INIT_ADDR_IDX")
+                addr_val = dag.add_op(Resource.FLOW, 1, 1, "flow",
+                    [("add_imm", ctx["tmp2"], self.scratch["inp_values_p"], 0)],
+                    batch, -1, "INIT_ADDR_VAL")
+            else:
+                prev_ctx = contexts[batch - 1]
+                prev_addr_idx, prev_addr_val = prev_init_addr_ops
+                addr_idx = dag.add_op(Resource.ALU, 1, 1, "alu",
+                    [("+", ctx["tmp1"], prev_ctx["tmp1"], c_8)],
+                    batch, -1, "INIT_ADDR_IDX")
+                dag.add_edge(prev_addr_idx, addr_idx)
+                addr_val = dag.add_op(Resource.ALU, 1, 1, "alu",
+                    [("+", ctx["tmp2"], prev_ctx["tmp2"], c_8)],
+                    batch, -1, "INIT_ADDR_VAL")
+                dag.add_edge(prev_addr_val, addr_val)
+
+            load_idx = dag.add_op(Resource.LOAD, 1, 2, "load",
+                [("vload", ctx["idx"], ctx["tmp1"])],
+                batch, -1, "INIT_LOAD_IDX")
+            dag.add_edge(addr_idx, load_idx)
+            load_val = dag.add_op(Resource.LOAD, 1, 2, "load",
+                [("vload", ctx["val"], ctx["tmp2"])],
+                batch, -1, "INIT_LOAD_VAL")
+            dag.add_edge(addr_val, load_val)
+
+            prev_init_addr_ops = (addr_idx, addr_val)
             prev_h5 = None
-            prev_idx_update = load_end
-            for rnd in range(self.rounds):
-                level = rnd % (self.forest_height + 1)
-                if level == 0 and prev_h5 is not None:
-                    val_ready = prev_h5
+            prev_idx_update = load_val
+
+            # Build rounds
+            for rnd in range(rounds):
+                level = rnd % n_levels
+                # Always wait for idx_update to ensure overflow check completes
+                val_ready = prev_idx_update
+
+                if level >= 3:
+                    prev_end, h5, idx_update = build_scattered(batch, rnd, level, val_ready, prev_idx_update)
                 else:
-                    val_ready = prev_idx_update
-                prev_end, h5, idx_update = self._build_round(dag, batch, rnd, level, val_ready, prev_idx_update)
+                    prev_end, h5, idx_update = build_non_scattered(batch, rnd, level, val_ready, prev_idx_update)
+
                 prev_h5 = h5
                 prev_idx_update = idx_update
+
             batch_final_ops[batch] = prev_end
 
+        # Build stores
         prev_store_addr_ops = None
-        for batch in range(self.n_batches):
-            prev_store_addr_ops = self._build_store(dag, batch, batch_final_ops[batch], prev_store_addr_ops)
-        return dag
+        for batch in range(n_batches):
+            ctx = contexts[batch]
+            if batch == 0:
+                addr_idx = dag.add_op(Resource.FLOW, 1, 1, "flow",
+                    [("add_imm", ctx["node"], self.scratch["inp_indices_p"], 0)],
+                    batch, -2, "STORE_ADDR_IDX")
+                addr_val = dag.add_op(Resource.FLOW, 1, 1, "flow",
+                    [("add_imm", ctx["node"] + 1, self.scratch["inp_values_p"], 0)],
+                    batch, -2, "STORE_ADDR_VAL")
+                dag.add_edge(batch_final_ops[batch], addr_idx)
+                dag.add_edge(batch_final_ops[batch], addr_val)
+            else:
+                prev_ctx = contexts[batch - 1]
+                prev_addr_idx, prev_addr_val = prev_store_addr_ops
+                addr_idx = dag.add_op(Resource.ALU, 1, 1, "alu",
+                    [("+", ctx["node"], prev_ctx["node"], c_8)],
+                    batch, -2, "STORE_ADDR_IDX")
+                dag.add_edge(batch_final_ops[batch], addr_idx)
+                dag.add_edge(prev_addr_idx, addr_idx)
+                addr_val = dag.add_op(Resource.ALU, 1, 1, "alu",
+                    [("+", ctx["node"] + 1, prev_ctx["node"] + 1, c_8)],
+                    batch, -2, "STORE_ADDR_VAL")
+                dag.add_edge(batch_final_ops[batch], addr_val)
+                dag.add_edge(prev_addr_val, addr_val)
 
-    def _build_init_load(self, dag: DAG, batch: int, prev_addr_ops) -> tuple:
-        ctx = self.contexts[batch]
-        if batch == 0:
-            addr_idx = dag.add_op(
-                Resource.FLOW, 1, 1, "flow",
-                [("add_imm", ctx["tmp1"], self.scratch["inp_indices_p"], 0)],
-                batch, -1, "INIT_ADDR_IDX"
-            )
-            addr_val = dag.add_op(
-                Resource.FLOW, 1, 1, "flow",
-                [("add_imm", ctx["tmp2"], self.scratch["inp_values_p"], 0)],
-                batch, -1, "INIT_ADDR_VAL"
-            )
-        else:
-            prev_ctx = self.contexts[batch - 1]
-            prev_addr_idx, prev_addr_val = prev_addr_ops
-            addr_idx = dag.add_op(
-                Resource.ALU, 1, 1, "alu",
-                [("+", ctx["tmp1"], prev_ctx["tmp1"], self.c_8)],
-                batch, -1, "INIT_ADDR_IDX"
-            )
-            dag.add_edge(prev_addr_idx, addr_idx)
-            addr_val = dag.add_op(
-                Resource.ALU, 1, 1, "alu",
-                [("+", ctx["tmp2"], prev_ctx["tmp2"], self.c_8)],
-                batch, -1, "INIT_ADDR_VAL"
-            )
-            dag.add_edge(prev_addr_val, addr_val)
+            store_idx = dag.add_op(Resource.STORE, 1, 1, "store",
+                [("vstore", ctx["node"], ctx["idx"])],
+                batch, -2, "STORE_IDX")
+            dag.add_edge(addr_idx, store_idx)
+            store_val = dag.add_op(Resource.STORE, 1, 1, "store",
+                [("vstore", ctx["node"] + 1, ctx["val"])],
+                batch, -2, "STORE_VAL")
+            dag.add_edge(addr_val, store_val)
+            prev_store_addr_ops = (addr_idx, addr_val)
 
-        load_idx = dag.add_op(
-            Resource.LOAD, 1, 2, "load",
-            [("vload", ctx["idx"], ctx["tmp1"])],
-            batch, -1, "INIT_LOAD_IDX"
-        )
-        dag.add_edge(addr_idx, load_idx)
-        load_val = dag.add_op(
-            Resource.LOAD, 1, 2, "load",
-            [("vload", ctx["val"], ctx["tmp2"])],
-            batch, -1, "INIT_LOAD_VAL"
-        )
-        dag.add_edge(addr_val, load_val)
-        return load_val, (addr_idx, addr_val)
+        # === SCHEDULE DAG ===
+        dag.analyze()
+        colors: Dict[int, List[Op]] = defaultdict(list)
+        color_usage: Dict[int, Dict[Resource, int]] = defaultdict(lambda: defaultdict(int))
 
-    def _build_round(self, dag: DAG, batch: int, rnd: int, level: int, val_ready: Op, idx_ready: Op) -> tuple:
-        if level >= 3:
-            return self._build_scattered(dag, batch, rnd, level, val_ready, idx_ready)
-        else:
-            return self._build_non_scattered(dag, batch, rnd, level, val_ready, idx_ready)
+        def can_schedule(op: Op, cycle: int) -> bool:
+            for pred in op.preds:
+                if pred.color < 0 or cycle < pred.color + pred.latency:
+                    return False
+            if color_usage[cycle][op.resource] + op.slots > LIMITS[op.resource]:
+                return False
+            return True
 
-    def _build_scattered(self, dag: DAG, batch: int, rnd: int, level: int, val_ready: Op, idx_ready: Op) -> tuple:
-        ctx = self.contexts[batch]
-        addr = dag.add_op(
-            Resource.ALU, 8, 1, "alu",
-            [("+", ctx["addr"] + i, self.scratch["forest_values_p"], ctx["idx"] + i) for i in range(8)],
-            batch, rnd, "ADDR"
-        )
-        dag.add_edge(idx_ready, addr)
+        def schedule_op(op: Op, cycle: int):
+            op.color = cycle
+            colors[cycle].append(op)
+            color_usage[cycle][op.resource] += op.slots
 
-        load_ops = []
-        for ld in range(4):
-            i = ld * 2
-            load_op = dag.add_op(
-                Resource.LOAD, 2, 2, "load",
-                [("load", ctx["node"] + i, ctx["addr"] + i),
-                 ("load", ctx["node"] + i + 1, ctx["addr"] + i + 1)],
-                batch, rnd, f"LOAD{ld}"
-            )
-            dag.add_edge(addr, load_op)
-            load_ops.append(load_op)
+        def get_stage(round_num):
+            if round_num == -1:
+                return 0
+            elif round_num == -2:
+                return 4
+            elif round_num <= 5:
+                return 1
+            elif round_num <= 10:
+                return 2
+            else:
+                return 3
 
-        xor = dag.add_op(
-            Resource.ALU, 8, 1, "alu",
-            [("^", ctx["val"] + i, ctx["val"] + i, ctx["node"] + i) for i in range(8)],
-            batch, rnd, "XOR"
-        )
-        for load_op in load_ops:
-            dag.add_edge(load_op, xor)
-        dag.add_edge(val_ready, xor)
+        ready = set()
+        scheduled = set()
+        for op in dag.ops.values():
+            if not op.preds:
+                ready.add(op.id)
+        cycle = 0
+        max_cycles = 10000
 
-        hash_end, h2i = self._build_hash(dag, batch, rnd, xor)
-        dag.add_edge(idx_ready, h2i)
+        while len(scheduled) < len(dag.ops) and cycle < max_cycles:
+            candidates = []
+            for op_id in ready:
+                op = dag.ops[op_id]
+                if not can_schedule(op, cycle):
+                    continue
+                stage = get_stage(op.round)
+                valu_boost = 1000 if op.resource == Resource.VALU else 0
+                batch_group = op.batch // 6 if op.batch >= 0 else -1
+                batch_in_group = op.batch % 6 if op.batch >= 0 else 0
+                if op.round >= 14:
+                    priority = (-valu_boost, op.round, batch_group, batch_in_group, stage, op.slack, op.id)
+                else:
+                    priority = (-valu_boost, stage, batch_group, batch_in_group, op.round, op.slack, op.id)
+                candidates.append((priority, op))
 
-        idx_and = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [("&", ctx["tmp1"], ctx["val"], self.v_one)],
-            batch, rnd, "IDX_AND"
-        )
-        dag.add_edge(hash_end, idx_and)
+            candidates.sort(key=lambda x: x[0])
+            for _, op in candidates:
+                if op.id in scheduled:
+                    continue
+                if can_schedule(op, cycle):
+                    schedule_op(op, cycle)
+                    scheduled.add(op.id)
+                    ready.discard(op.id)
+                    for succ in op.succs:
+                        if succ.id not in scheduled and succ.id not in ready:
+                            if all(p.color >= 0 for p in succ.preds):
+                                ready.add(succ.id)
+            cycle += 1
 
-        idx_add = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [("+", ctx["idx"], ctx["idx"], ctx["tmp1"])],
-            batch, rnd, "IDX_ADD"
-        )
-        dag.add_edge(idx_and, idx_add)
-        dag.add_edge(h2i, idx_add)
+        # === GENERATE INSTRUCTIONS ===
+        if colors:
+            max_color = max(colors.keys())
+            for color in range(max_color + 1):
+                instr = defaultdict(list)
+                for op in colors.get(color, []):
+                    for data in op.instr_data:
+                        instr[op.instr_type].append(data)
+                cycle_instr = {}
+                if instr["valu"]:
+                    cycle_instr["valu"] = instr["valu"][:6]
+                if instr["alu"]:
+                    cycle_instr["alu"] = instr["alu"][:12]
+                if instr["load"]:
+                    cycle_instr["load"] = instr["load"][:2]
+                if instr["store"]:
+                    cycle_instr["store"] = instr["store"][:2]
+                if instr["flow"]:
+                    cycle_instr["flow"] = instr["flow"][:1]
+                self.instrs.append(cycle_instr)
+            while self.instrs and not self.instrs[-1]:
+                self.instrs.pop()
 
-        if level == self.forest_height:
-            ovf_lt = dag.add_op(
-                Resource.VALU, 1, 1, "valu",
-                [("<", ctx["tmp1"], ctx["idx"], self.v_n_nodes)],
-                batch, rnd, "OVF_LT"
-            )
-            dag.add_edge(idx_add, ovf_lt)
-            ovf_sel = dag.add_op(
-                Resource.FLOW, 1, 1, "flow",
-                [("vselect", ctx["idx"], ctx["tmp1"], ctx["idx"], self.v_zero)],
-                batch, rnd, "OVF_SEL"
-            )
-            dag.add_edge(ovf_lt, ovf_sel)
-            return ovf_sel, hash_end, ovf_sel
-        return idx_add, hash_end, idx_add
-
-    def _build_non_scattered(self, dag: DAG, batch: int, rnd: int, level: int, val_ready: Op, idx_ready: Op) -> tuple:
-        ctx = self.contexts[batch]
-        fn = self.v_forest_nodes
-
-        if level == 0:
-            xor = dag.add_op(
-                Resource.ALU, 8, 1, "alu",
-                [("^", ctx["val"] + i, ctx["val"] + i, fn[0] + i) for i in range(8)],
-                batch, rnd, "XOR"
-            )
-            dag.add_edge(val_ready, xor)
-            xor_end = xor
-        elif level == 1:
-            and1 = dag.add_op(
-                Resource.VALU, 1, 1, "valu",
-                [("&", ctx["tmp1"], ctx["idx"], self.v_one)],
-                batch, rnd, "AND1"
-            )
-            dag.add_edge(idx_ready, and1)
-            vsel1 = dag.add_op(
-                Resource.FLOW, 1, 1, "flow",
-                [("vselect", ctx["tmp2"], ctx["tmp1"], fn[1], fn[2])],
-                batch, rnd, "VSEL1"
-            )
-            dag.add_edge(and1, vsel1)
-            xor = dag.add_op(
-                Resource.ALU, 8, 1, "alu",
-                [("^", ctx["val"] + i, ctx["val"] + i, ctx["tmp2"] + i) for i in range(8)],
-                batch, rnd, "XOR"
-            )
-            dag.add_edge(vsel1, xor)
-            dag.add_edge(val_ready, xor)
-            xor_end = xor
-        else:
-            and1 = dag.add_op(
-                Resource.VALU, 1, 1, "valu",
-                [("&", ctx["tmp1"], ctx["idx"], self.v_one)],
-                batch, rnd, "AND1"
-            )
-            dag.add_edge(idx_ready, and1)
-            vsel1 = dag.add_op(
-                Resource.FLOW, 1, 1, "flow",
-                [("vselect", ctx["tmp2"], ctx["tmp1"], fn[3], fn[4])],
-                batch, rnd, "VSEL1"
-            )
-            dag.add_edge(and1, vsel1)
-            vsel2 = dag.add_op(
-                Resource.FLOW, 1, 1, "flow",
-                [("vselect", ctx["node"], ctx["tmp1"], fn[5], fn[6])],
-                batch, rnd, "VSEL2"
-            )
-            dag.add_edge(vsel1, vsel2)
-            lt = dag.add_op(
-                Resource.VALU, 1, 1, "valu",
-                [("<", ctx["tmp1"], ctx["idx"], self.v_five)],
-                batch, rnd, "LT"
-            )
-            dag.add_edge(vsel2, lt)
-            dag.add_edge(idx_ready, lt)
-            vsel3 = dag.add_op(
-                Resource.FLOW, 1, 1, "flow",
-                [("vselect", ctx["tmp2"], ctx["tmp1"], ctx["tmp2"], ctx["node"])],
-                batch, rnd, "VSEL3"
-            )
-            dag.add_edge(lt, vsel3)
-            xor = dag.add_op(
-                Resource.ALU, 8, 1, "alu",
-                [("^", ctx["val"] + i, ctx["val"] + i, ctx["tmp2"] + i) for i in range(8)],
-                batch, rnd, "XOR"
-            )
-            dag.add_edge(vsel3, xor)
-            dag.add_edge(val_ready, xor)
-            xor_end = xor
-
-        hash_end, h2i = self._build_hash(dag, batch, rnd, xor_end)
-        dag.add_edge(idx_ready, h2i)
-
-        idx_and = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [("&", ctx["tmp1"], ctx["val"], self.v_one)],
-            batch, rnd, "IDX_AND"
-        )
-        dag.add_edge(hash_end, idx_and)
-        idx_add = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [("+", ctx["idx"], ctx["idx"], ctx["tmp1"])],
-            batch, rnd, "IDX_ADD"
-        )
-        dag.add_edge(idx_and, idx_add)
-        dag.add_edge(h2i, idx_add)
-        return idx_add, hash_end, idx_add
-
-    def _build_hash(self, dag: DAG, batch: int, rnd: int, prev: Op) -> Op:
-        ctx = self.contexts[batch]
-        hc1, hc2 = self.v_hash_const1, self.v_hash_const2
-
-        h0 = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [("multiply_add", ctx["val"], ctx["val"], self.v_mult0, hc1[0])],
-            batch, rnd, "H0"
-        )
-        dag.add_edge(prev, h0)
-
-        h1a = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [(HASH_STAGES[1][0], ctx["tmp1"], ctx["val"], hc1[1])],
-            batch, rnd, "H1A"
-        )
-        dag.add_edge(h0, h1a)
-
-        h1b = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [(HASH_STAGES[1][3], ctx["tmp2"], ctx["val"], hc2[1])],
-            batch, rnd, "H1B"
-        )
-        dag.add_edge(h0, h1b)
-
-        h1 = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [(HASH_STAGES[1][2], ctx["val"], ctx["tmp1"], ctx["tmp2"])],
-            batch, rnd, "H1"
-        )
-        dag.add_edge(h1a, h1)
-        dag.add_edge(h1b, h1)
-
-        h2v = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [("multiply_add", ctx["val"], ctx["val"], self.v_mult2, hc1[2])],
-            batch, rnd, "H2V"
-        )
-        dag.add_edge(h1, h2v)
-
-        h2i = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [("multiply_add", ctx["idx"], ctx["idx"], self.v_two, self.v_one)],
-            batch, rnd, "H2I"
-        )
-        dag.add_edge(prev, h2i)
-
-        h3a = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [(HASH_STAGES[3][0], ctx["tmp1"], ctx["val"], hc1[3])],
-            batch, rnd, "H3A"
-        )
-        dag.add_edge(h2v, h3a)
-
-        h3b = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [(HASH_STAGES[3][3], ctx["tmp2"], ctx["val"], hc2[3])],
-            batch, rnd, "H3B"
-        )
-        dag.add_edge(h2v, h3b)
-
-        h3 = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [(HASH_STAGES[3][2], ctx["val"], ctx["tmp1"], ctx["tmp2"])],
-            batch, rnd, "H3"
-        )
-        dag.add_edge(h3a, h3)
-        dag.add_edge(h3b, h3)
-
-        h4 = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [("multiply_add", ctx["val"], ctx["val"], self.v_mult4, hc1[4])],
-            batch, rnd, "H4"
-        )
-        dag.add_edge(h3, h4)
-
-        h5a = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [(HASH_STAGES[5][0], ctx["tmp1"], ctx["val"], hc1[5])],
-            batch, rnd, "H5A"
-        )
-        dag.add_edge(h4, h5a)
-
-        h5b = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [(HASH_STAGES[5][3], ctx["tmp2"], ctx["val"], hc2[5])],
-            batch, rnd, "H5B"
-        )
-        dag.add_edge(h4, h5b)
-
-        h5 = dag.add_op(
-            Resource.VALU, 1, 1, "valu",
-            [(HASH_STAGES[5][2], ctx["val"], ctx["tmp1"], ctx["tmp2"])],
-            batch, rnd, "H5"
-        )
-        dag.add_edge(h5a, h5)
-        dag.add_edge(h5b, h5)
-
-        return h5, h2i
-
-    def _build_store(self, dag: DAG, batch: int, prev_end: Op, prev_store_addr_ops) -> tuple:
-        ctx = self.contexts[batch]
-        if batch == 0:
-            addr_idx = dag.add_op(
-                Resource.FLOW, 1, 1, "flow",
-                [("add_imm", ctx["node"], self.scratch["inp_indices_p"], 0)],
-                batch, -2, "STORE_ADDR_IDX"
-            )
-            addr_val = dag.add_op(
-                Resource.FLOW, 1, 1, "flow",
-                [("add_imm", ctx["node"] + 1, self.scratch["inp_values_p"], 0)],
-                batch, -2, "STORE_ADDR_VAL"
-            )
-            dag.add_edge(prev_end, addr_idx)
-            dag.add_edge(prev_end, addr_val)
-        else:
-            prev_ctx = self.contexts[batch - 1]
-            prev_addr_idx, prev_addr_val = prev_store_addr_ops
-            addr_idx = dag.add_op(
-                Resource.ALU, 1, 1, "alu",
-                [("+", ctx["node"], prev_ctx["node"], self.c_8)],
-                batch, -2, "STORE_ADDR_IDX"
-            )
-            dag.add_edge(prev_end, addr_idx)
-            dag.add_edge(prev_addr_idx, addr_idx)
-            addr_val = dag.add_op(
-                Resource.ALU, 1, 1, "alu",
-                [("+", ctx["node"] + 1, prev_ctx["node"] + 1, self.c_8)],
-                batch, -2, "STORE_ADDR_VAL"
-            )
-            dag.add_edge(prev_end, addr_val)
-            dag.add_edge(prev_addr_val, addr_val)
-
-        store_idx = dag.add_op(
-            Resource.STORE, 1, 1, "store",
-            [("vstore", ctx["node"], ctx["idx"])],
-            batch, -2, "STORE_IDX"
-        )
-        dag.add_edge(addr_idx, store_idx)
-        store_val = dag.add_op(
-            Resource.STORE, 1, 1, "store",
-            [("vstore", ctx["node"] + 1, ctx["val"])],
-            batch, -2, "STORE_VAL"
-        )
-        dag.add_edge(addr_val, store_val)
-        return (addr_idx, addr_val)
+        self.instrs.append({"flow": [("pause",)]})
 
 
 BASELINE = 147734
