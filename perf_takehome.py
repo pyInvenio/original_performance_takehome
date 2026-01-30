@@ -1,12 +1,3 @@
-"""
-DAG-scheduled kernel achieving 1417 cycles (69 cycles faster than greedy).
-
-Uses graph coloring / DAG scheduling approach:
-1. Build DAG of all operations with dependencies
-2. Schedule using pipeline-tuned list scheduling
-3. Convert schedule to instructions
-"""
-
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
@@ -27,10 +18,6 @@ from problem import (
     reference_kernel2,
 )
 
-
-# ============================================================================
-# DAG Infrastructure
-# ============================================================================
 
 class Resource(Enum):
     ALU = auto()
@@ -60,10 +47,8 @@ class Op:
     batch: int = -1
     round: int = -1
     stage: str = ""
-
     preds: List['Op'] = field(default_factory=list)
     succs: List['Op'] = field(default_factory=list)
-
     asap: int = 0
     alap: int = 0
     slack: int = 0
@@ -109,11 +94,9 @@ class DAG:
     def topological_order(self) -> List[Op]:
         if self._topo_order is not None:
             return self._topo_order
-
         in_degree = {op.id: len(op.preds) for op in self.ops.values()}
         queue = [op for op in self.ops.values() if in_degree[op.id] == 0]
         result = []
-
         while queue:
             queue.sort(key=lambda op: op.id)
             op = queue.pop(0)
@@ -122,37 +105,29 @@ class DAG:
                 in_degree[succ.id] -= 1
                 if in_degree[succ.id] == 0:
                     queue.append(succ)
-
         self._topo_order = result
         return result
 
     def analyze(self):
         if self._analysis_done:
             return
-
         topo = self.topological_order()
-
         for op in topo:
             if not op.preds:
                 op.asap = 0
             else:
                 op.asap = max(p.asap + p.latency for p in op.preds)
-
         critical_path = max(op.asap + op.latency for op in topo) if topo else 0
-
         for op in reversed(topo):
             if not op.succs:
                 op.alap = critical_path - op.latency
             else:
                 op.alap = min(s.alap - op.latency for s in op.succs)
             op.slack = op.alap - op.asap
-
         self._analysis_done = True
 
 
 class PipelineScheduler:
-    """Pipeline-tuned list scheduler."""
-
     def __init__(self, dag: DAG):
         self.dag = dag
         self.dag.analyze()
@@ -178,57 +153,46 @@ class PipelineScheduler:
         self.colors[cycle].append(op)
         self.color_usage[cycle][op.resource] += op.slots
 
-    def schedule(self, overlap_depth=6, trace_slots=False) -> int:
-        """Pipeline-tuned scheduling with tail optimization."""
+    def _get_stage(self, round_num):
+        if round_num == -1:
+            return 0
+        elif round_num == -2:
+            return 4
+        elif round_num <= 5:
+            return 1
+        elif round_num <= 10:
+            return 2
+        else:
+            return 3
+
+    def schedule(self) -> int:
         self.reset()
-
-        def get_stage(round_num):
-            if round_num == -1:
-                return 0  # Init
-            elif round_num == -2:
-                return 4  # Store
-            elif round_num <= 5:
-                return 1
-            elif round_num <= 10:
-                return 2
-            else:
-                return 3
-
         batch_stage_start = defaultdict(lambda: defaultdict(lambda: float('inf')))
-
         ready = set()
         scheduled = set()
-
         for op in self.dag.ops.values():
             if not op.preds:
                 ready.add(op.id)
-
         cycle = 0
         max_cycles = 10000
 
         while len(scheduled) < len(self.dag.ops) and cycle < max_cycles:
             candidates = []
-
             for op_id in ready:
                 op = self.dag.ops[op_id]
                 if not self.can_schedule(op, cycle):
                     continue
-
-                stage = get_stage(op.round)
-                can_enter = True
-
-                if can_enter:
-                    valu_boost = 1000 if op.resource == Resource.VALU else 0
-
-                    # For late rounds (14-15), prioritize round over batch to pack work tighter
-                    if op.round >= 14:
-                        priority = (-valu_boost, op.round, op.batch, stage, op.slack, op.id)
-                    else:
-                        priority = (-valu_boost, stage, op.batch, op.round, op.slack, op.id)
-                    candidates.append((priority, op))
+                stage = self._get_stage(op.round)
+                valu_boost = 1000 if op.resource == Resource.VALU else 0
+                batch_group = op.batch // 6 if op.batch >= 0 else -1
+                batch_in_group = op.batch % 6 if op.batch >= 0 else 0
+                if op.round >= 14:
+                    priority = (-valu_boost, op.round, batch_group, batch_in_group, stage, op.slack, op.id)
+                else:
+                    priority = (-valu_boost, stage, batch_group, batch_in_group, op.round, op.slack, op.id)
+                candidates.append((priority, op))
 
             candidates.sort(key=lambda x: x[0])
-
             for _, op in candidates:
                 if op.id in scheduled:
                     continue
@@ -236,74 +200,26 @@ class PipelineScheduler:
                     self.schedule_op(op, cycle)
                     scheduled.add(op.id)
                     ready.discard(op.id)
-
-                    stage = get_stage(op.round)
-                    batch_stage_start[op.batch][stage] = min(
-                        batch_stage_start[op.batch][stage], cycle
-                    )
-
+                    stage = self._get_stage(op.round)
+                    batch_stage_start[op.batch][stage] = min(batch_stage_start[op.batch][stage], cycle)
                     for succ in op.succs:
                         if succ.id not in scheduled and succ.id not in ready:
                             if all(p.color >= 0 for p in succ.preds):
                                 ready.add(succ.id)
-
             cycle += 1
 
-        total_cycles = max(self.colors.keys()) + 1 if self.colors else 0
-
-        if trace_slots:
-            # Print detailed slot utilization
-            print("\n=== FLOW SLOT UTILIZATION ===")
-            flow_ops = []
-            for c in range(total_cycles):
-                flow_used = self.color_usage[c][Resource.FLOW]
-                ops_at_cycle = self.colors.get(c, [])
-
-                if flow_used > 0:
-                    flow_op = [op for op in ops_at_cycle if op.resource == Resource.FLOW]
-                    if flow_op:
-                        op = flow_op[0]
-                        flow_ops.append((c, op.batch, op.round, op.stage))
-
-            print(f"Total FLOW ops: {len(flow_ops)} out of {total_cycles} cycles")
-            print("FLOW ops by stage:")
-            from collections import Counter
-            stage_counts = Counter(op[3] for op in flow_ops)
-            for stage, count in sorted(stage_counts.items()):
-                print(f"  {stage}: {count}")
-
-            # Show FLOW gaps
-            print("\nFLOW-free gap regions (5+ consecutive cycles):")
-            gap_start = None
-            for c in range(total_cycles):
-                flow_used = self.color_usage[c][Resource.FLOW]
-                if flow_used == 0:
-                    if gap_start is None:
-                        gap_start = c
-                else:
-                    if gap_start is not None and c - gap_start >= 5:
-                        print(f"  Cycles {gap_start}-{c-1}: {c - gap_start} free FLOW slots")
-                    gap_start = None
-            if gap_start is not None and total_cycles - gap_start >= 5:
-                print(f"  Cycles {gap_start}-{total_cycles-1}: {total_cycles - gap_start} free FLOW slots")
-
-        return total_cycles
+        return max(self.colors.keys()) + 1 if self.colors else 0
 
     def generate_instructions(self) -> List[Dict]:
-        """Convert schedule to instruction list."""
         if not self.colors:
             return []
-
         max_color = max(self.colors.keys())
         instructions = []
-
         for color in range(max_color + 1):
             instr = defaultdict(list)
-
             for op in self.colors.get(color, []):
                 for data in op.instr_data:
                     instr[op.instr_type].append(data)
-
             cycle_instr = {}
             if instr["valu"]:
                 cycle_instr["valu"] = instr["valu"][:6]
@@ -315,19 +231,11 @@ class PipelineScheduler:
                 cycle_instr["store"] = instr["store"][:2]
             if instr["flow"]:
                 cycle_instr["flow"] = instr["flow"][:1]
-
             instructions.append(cycle_instr)
-
-        # Remove trailing empty instructions
         while instructions and not instructions[-1]:
             instructions.pop()
-
         return instructions
 
-
-# ============================================================================
-# Kernel Builder (DAG-based)
-# ============================================================================
 
 class KernelBuilder:
     def __init__(self):
@@ -352,12 +260,18 @@ class KernelBuilder:
         return self.alloc_scratch(name, VLEN)
 
     def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
-        """Build kernel using DAG scheduler."""
         self.forest_height = forest_height
         self.rounds = rounds
         self.n_batches = batch_size // VLEN
+        self._alloc_memory()
+        self._build_init()
+        dag = self._build_dag()
+        scheduler = PipelineScheduler(dag)
+        scheduler.schedule()
+        self.instrs.extend(scheduler.generate_instructions())
+        self.instrs.append({"flow": [("pause",)]})
 
-        # ===== ALLOCATE CONTEXTS =====
+    def _alloc_memory(self):
         self.contexts = []
         for g in range(self.n_batches):
             ctx = {
@@ -370,37 +284,27 @@ class KernelBuilder:
             ctx["addr"] = ctx["tmp1"]
             self.contexts.append(ctx)
 
-        # ===== VECTOR CONSTANTS =====
         self.v_zero = self.alloc_vec("v_zero")
         self.v_one = self.alloc_vec("v_one")
         self.v_two = self.alloc_vec("v_two")
         self.v_five = self.alloc_vec("v_five")
         self.v_n_nodes = self.alloc_vec("v_n_nodes")
         self.v_forest_base = self.alloc_vec("v_forest_base")
-
-        # Hash constants
         self.v_hash_const1 = [self.alloc_vec(f"v_hash{i}_const1") for i in range(6)]
         self.v_hash_const2 = [self.alloc_vec(f"v_hash{i}_const2") for i in range(6)]
         self.v_mult0 = self.alloc_vec("v_mult0")
         self.v_mult2 = self.alloc_vec("v_mult2")
         self.v_mult4 = self.alloc_vec("v_mult4")
-
-        # Forest node cache
         self.v_forest_nodes = [self.alloc_vec(f"v_forest_node_{i}") for i in range(7)]
 
-        # ===== SCALAR TEMPS =====
         self.tmp1 = self.alloc_scratch("tmp1")
         self.tmp2 = self.alloc_scratch("tmp2")
         self.alloc_scratch("n_nodes")
         self.alloc_scratch("forest_values_p")
         self.alloc_scratch("inp_indices_p")
         self.alloc_scratch("inp_values_p")
-
-        # Scalar constants
         for val in [0, 1, 2, 5]:
             self.alloc_scratch(f"c_{val}")
-
-        # Hash scalar constants
         for i in range(6):
             self.alloc_scratch(f"hash{i}_c1")
             self.alloc_scratch(f"hash{i}_c2")
@@ -408,38 +312,15 @@ class KernelBuilder:
         self.alloc_scratch("mult_1")
         self.alloc_scratch("forest_cache", 8)
 
-        print(f"Scratch: {self.scratch_ptr}")
-
-        # ===== INIT INSTRUCTIONS =====
-        self._build_init()
-
-        # ===== BUILD AND SCHEDULE DAG =====
-        dag = self._build_dag()
-        scheduler = PipelineScheduler(dag)
-        makespan = scheduler.schedule(overlap_depth=8, trace_slots=True)
-
-        # Convert schedule to instructions
-        dag_instrs = scheduler.generate_instructions()
-        self.instrs.extend(dag_instrs)
-
-        # Final pause
-        self.instrs.append({"flow": [("pause",)]})
-
     def _build_init(self):
-        """Build initialization instructions."""
-        # Load init vars
         self.instrs.append({"load": [("const", self.tmp1, 1), ("const", self.tmp2, 4)]})
         self.instrs.append({"load": [("load", self.scratch["n_nodes"], self.tmp1),
                                       ("load", self.scratch["forest_values_p"], self.tmp2)]})
         self.instrs.append({"load": [("const", self.tmp1, 5), ("const", self.tmp2, 6)]})
         self.instrs.append({"load": [("load", self.scratch["inp_indices_p"], self.tmp1),
                                       ("load", self.scratch["inp_values_p"], self.tmp2)]})
-
-        # Load scalar constants
         self.instrs.append({"load": [("const", self.scratch["c_0"], 0), ("const", self.scratch["c_1"], 1)]})
         self.instrs.append({"load": [("const", self.scratch["c_2"], 2), ("const", self.scratch["c_5"], 5)]})
-
-        # Broadcast basic constants
         self.instrs.append({"valu": [
             ("vbroadcast", self.v_two, self.scratch["c_2"]),
             ("vbroadcast", self.v_one, self.scratch["c_1"]),
@@ -449,22 +330,18 @@ class KernelBuilder:
             ("vbroadcast", self.v_forest_base, self.scratch["forest_values_p"]),
         ]})
 
-        # Hash constants
         hash_const1_vals = [HASH_STAGES[i][1] for i in range(6)]
         hash_const2_vals = [HASH_STAGES[i][4] for i in range(6)]
         mult_vals = [1 + (1 << 12), 1 + (1 << 5), 1 + (1 << 3)]
-
         hash_c1_addrs = [self.scratch[f"hash{i}_c1"] for i in range(6)]
         hash_c2_addrs = [self.scratch[f"hash{i}_c2"] for i in range(6)]
         mult_addrs = [self.scratch["mult_0"], self.scratch["mult_1"]]
 
-        # Load hash constants
         for i in range(0, 6, 2):
             self.instrs.append({"load": [
                 ("const", hash_c1_addrs[i], hash_const1_vals[i]),
                 ("const", hash_c1_addrs[i + 1], hash_const1_vals[i + 1])
             ]})
-
         for i in range(0, 6, 2):
             self.instrs.append({
                 "load": [
@@ -476,8 +353,6 @@ class KernelBuilder:
                     ("vbroadcast", self.v_hash_const1[i + 1], hash_c1_addrs[i + 1])
                 ]
             })
-
-        # Mult constants and forest cache
         self.instrs.append({
             "load": [
                 ("const", mult_addrs[0], mult_vals[0]),
@@ -490,7 +365,6 @@ class KernelBuilder:
                 ("vbroadcast", self.v_hash_const2[3], hash_c2_addrs[3]),
             ]
         })
-
         forest_cache = self.scratch["forest_cache"]
         self.instrs.append({
             "load": [
@@ -502,8 +376,6 @@ class KernelBuilder:
                 ("vbroadcast", self.v_hash_const2[5], hash_c2_addrs[5]),
             ]
         })
-
-        # Broadcast mult and forest nodes
         self.instrs.append({"valu": [
             ("vbroadcast", self.v_mult0, mult_addrs[0]),
             ("vbroadcast", self.v_mult2, mult_addrs[1]),
@@ -513,41 +385,38 @@ class KernelBuilder:
         self.instrs.append({"valu": [
             ("vbroadcast", self.v_forest_nodes[i], forest_cache + i) for i in range(6)
         ]})
-
-        # Reuse hash0_c1 (now dead) for c_8 = VLEN for incremental addressing
         self.c_8 = hash_c1_addrs[0]
         self.instrs.append({"load": [("const", self.c_8, VLEN)]})
 
-
     def _build_dag(self) -> DAG:
-        """Build the operation DAG."""
         dag = DAG(n_batches=self.n_batches)
-
-        # Track address ops for incremental computation
         prev_init_addr_ops = None
-        batch_final_ops = []  # (prev_end, batch) for stores
+        batch_final_ops = [None] * self.n_batches
 
         for batch in range(self.n_batches):
             load_end, addr_ops = self._build_init_load(dag, batch, prev_init_addr_ops)
             prev_init_addr_ops = addr_ops
-            prev_end = load_end
+            prev_h5 = None
+            prev_idx_update = load_end
             for rnd in range(self.rounds):
                 level = rnd % (self.forest_height + 1)
-                prev_end = self._build_round(dag, batch, rnd, level, prev_end)
-            batch_final_ops.append(prev_end)
+                if level == 0 and prev_h5 is not None:
+                    val_ready = prev_h5
+                else:
+                    val_ready = prev_idx_update
+                prev_end, h5, idx_update = self._build_round(dag, batch, rnd, level, val_ready, prev_idx_update)
+                prev_h5 = h5
+                prev_idx_update = idx_update
+            batch_final_ops[batch] = prev_end
 
-        # Build stores with incremental addressing
         prev_store_addr_ops = None
         for batch in range(self.n_batches):
             prev_store_addr_ops = self._build_store(dag, batch, batch_final_ops[batch], prev_store_addr_ops)
-
         return dag
 
     def _build_init_load(self, dag: DAG, batch: int, prev_addr_ops) -> tuple:
         ctx = self.contexts[batch]
-
         if batch == 0:
-            # First batch: use FLOW add_imm
             addr_idx = dag.add_op(
                 Resource.FLOW, 1, 1, "flow",
                 [("add_imm", ctx["tmp1"], self.scratch["inp_indices_p"], 0)],
@@ -559,18 +428,14 @@ class KernelBuilder:
                 batch, -1, "INIT_ADDR_VAL"
             )
         else:
-            # Subsequent batches: use ALU to add VLEN to previous batch's address
             prev_ctx = self.contexts[batch - 1]
             prev_addr_idx, prev_addr_val = prev_addr_ops
-
-            # Both ALU ops can run in same cycle (12 slots available)
             addr_idx = dag.add_op(
                 Resource.ALU, 1, 1, "alu",
                 [("+", ctx["tmp1"], prev_ctx["tmp1"], self.c_8)],
                 batch, -1, "INIT_ADDR_IDX"
             )
             dag.add_edge(prev_addr_idx, addr_idx)
-
             addr_val = dag.add_op(
                 Resource.ALU, 1, 1, "alu",
                 [("+", ctx["tmp2"], prev_ctx["tmp2"], self.c_8)],
@@ -584,35 +449,29 @@ class KernelBuilder:
             batch, -1, "INIT_LOAD_IDX"
         )
         dag.add_edge(addr_idx, load_idx)
-
         load_val = dag.add_op(
             Resource.LOAD, 1, 2, "load",
             [("vload", ctx["val"], ctx["tmp2"])],
             batch, -1, "INIT_LOAD_VAL"
         )
         dag.add_edge(addr_val, load_val)
-
         return load_val, (addr_idx, addr_val)
 
-    def _build_round(self, dag: DAG, batch: int, rnd: int, level: int, prev_end: Op) -> Op:
+    def _build_round(self, dag: DAG, batch: int, rnd: int, level: int, val_ready: Op, idx_ready: Op) -> tuple:
         if level >= 3:
-            return self._build_scattered(dag, batch, rnd, level, prev_end)
+            return self._build_scattered(dag, batch, rnd, level, val_ready, idx_ready)
         else:
-            return self._build_non_scattered(dag, batch, rnd, level, prev_end)
+            return self._build_non_scattered(dag, batch, rnd, level, val_ready, idx_ready)
 
-    def _build_scattered(self, dag: DAG, batch: int, rnd: int, level: int, prev_end: Op) -> Op:
-        """Scattered round with parallel loads."""
+    def _build_scattered(self, dag: DAG, batch: int, rnd: int, level: int, val_ready: Op, idx_ready: Op) -> tuple:
         ctx = self.contexts[batch]
-
-        # Address computation
         addr = dag.add_op(
             Resource.ALU, 8, 1, "alu",
             [("+", ctx["addr"] + i, self.scratch["forest_values_p"], ctx["idx"] + i) for i in range(8)],
             batch, rnd, "ADDR"
         )
-        dag.add_edge(prev_end, addr)
+        dag.add_edge(idx_ready, addr)
 
-        # Parallel loads (all depend on addr)
         load_ops = []
         for ld in range(4):
             i = ld * 2
@@ -625,7 +484,6 @@ class KernelBuilder:
             dag.add_edge(addr, load_op)
             load_ops.append(load_op)
 
-        # XOR depends on all loads
         xor = dag.add_op(
             Resource.ALU, 8, 1, "alu",
             [("^", ctx["val"] + i, ctx["val"] + i, ctx["node"] + i) for i in range(8)],
@@ -633,11 +491,11 @@ class KernelBuilder:
         )
         for load_op in load_ops:
             dag.add_edge(load_op, xor)
+        dag.add_edge(val_ready, xor)
 
-        # Hash
         hash_end, h2i = self._build_hash(dag, batch, rnd, xor)
+        dag.add_edge(idx_ready, h2i)
 
-        # Index update
         idx_and = dag.add_op(
             Resource.VALU, 1, 1, "valu",
             [("&", ctx["tmp1"], ctx["val"], self.v_one)],
@@ -651,9 +509,8 @@ class KernelBuilder:
             batch, rnd, "IDX_ADD"
         )
         dag.add_edge(idx_and, idx_add)
-        dag.add_edge(h2i, idx_add)  # idx_add must wait for h2i (both modify idx)
+        dag.add_edge(h2i, idx_add)
 
-        # Overflow check at top level - use vselect for efficiency
         if level == self.forest_height:
             ovf_lt = dag.add_op(
                 Resource.VALU, 1, 1, "valu",
@@ -661,19 +518,16 @@ class KernelBuilder:
                 batch, rnd, "OVF_LT"
             )
             dag.add_edge(idx_add, ovf_lt)
-
-            # Use vselect: if idx < n_nodes, keep idx; else 0
             ovf_sel = dag.add_op(
                 Resource.FLOW, 1, 1, "flow",
                 [("vselect", ctx["idx"], ctx["tmp1"], ctx["idx"], self.v_zero)],
                 batch, rnd, "OVF_SEL"
             )
             dag.add_edge(ovf_lt, ovf_sel)
-            return ovf_sel
+            return ovf_sel, hash_end, ovf_sel
+        return idx_add, hash_end, idx_add
 
-        return idx_add
-
-    def _build_non_scattered(self, dag: DAG, batch: int, rnd: int, level: int, prev_end: Op) -> Op:
+    def _build_non_scattered(self, dag: DAG, batch: int, rnd: int, level: int, val_ready: Op, idx_ready: Op) -> tuple:
         ctx = self.contexts[batch]
         fn = self.v_forest_nodes
 
@@ -683,96 +537,87 @@ class KernelBuilder:
                 [("^", ctx["val"] + i, ctx["val"] + i, fn[0] + i) for i in range(8)],
                 batch, rnd, "XOR"
             )
-            dag.add_edge(prev_end, xor)
+            dag.add_edge(val_ready, xor)
             xor_end = xor
-
         elif level == 1:
             and1 = dag.add_op(
                 Resource.VALU, 1, 1, "valu",
                 [("&", ctx["tmp1"], ctx["idx"], self.v_one)],
                 batch, rnd, "AND1"
             )
-            dag.add_edge(prev_end, and1)
-
+            dag.add_edge(idx_ready, and1)
             vsel1 = dag.add_op(
                 Resource.FLOW, 1, 1, "flow",
                 [("vselect", ctx["tmp2"], ctx["tmp1"], fn[1], fn[2])],
                 batch, rnd, "VSEL1"
             )
             dag.add_edge(and1, vsel1)
-
             xor = dag.add_op(
                 Resource.ALU, 8, 1, "alu",
                 [("^", ctx["val"] + i, ctx["val"] + i, ctx["tmp2"] + i) for i in range(8)],
                 batch, rnd, "XOR"
             )
             dag.add_edge(vsel1, xor)
+            dag.add_edge(val_ready, xor)
             xor_end = xor
-
-        else:  # level == 2
+        else:
             and1 = dag.add_op(
                 Resource.VALU, 1, 1, "valu",
                 [("&", ctx["tmp1"], ctx["idx"], self.v_one)],
                 batch, rnd, "AND1"
             )
-            dag.add_edge(prev_end, and1)
-
+            dag.add_edge(idx_ready, and1)
             vsel1 = dag.add_op(
                 Resource.FLOW, 1, 1, "flow",
                 [("vselect", ctx["tmp2"], ctx["tmp1"], fn[3], fn[4])],
                 batch, rnd, "VSEL1"
             )
             dag.add_edge(and1, vsel1)
-
             vsel2 = dag.add_op(
                 Resource.FLOW, 1, 1, "flow",
                 [("vselect", ctx["node"], ctx["tmp1"], fn[5], fn[6])],
                 batch, rnd, "VSEL2"
             )
             dag.add_edge(vsel1, vsel2)
-
             lt = dag.add_op(
                 Resource.VALU, 1, 1, "valu",
                 [("<", ctx["tmp1"], ctx["idx"], self.v_five)],
                 batch, rnd, "LT"
             )
             dag.add_edge(vsel2, lt)
-
+            dag.add_edge(idx_ready, lt)
             vsel3 = dag.add_op(
                 Resource.FLOW, 1, 1, "flow",
                 [("vselect", ctx["tmp2"], ctx["tmp1"], ctx["tmp2"], ctx["node"])],
                 batch, rnd, "VSEL3"
             )
             dag.add_edge(lt, vsel3)
-
             xor = dag.add_op(
                 Resource.ALU, 8, 1, "alu",
                 [("^", ctx["val"] + i, ctx["val"] + i, ctx["tmp2"] + i) for i in range(8)],
                 batch, rnd, "XOR"
             )
             dag.add_edge(vsel3, xor)
+            dag.add_edge(val_ready, xor)
             xor_end = xor
 
-        # Hash
         hash_end, h2i = self._build_hash(dag, batch, rnd, xor_end)
+        dag.add_edge(idx_ready, h2i)
 
-        # Index update
         idx_and = dag.add_op(
             Resource.VALU, 1, 1, "valu",
             [("&", ctx["tmp1"], ctx["val"], self.v_one)],
             batch, rnd, "IDX_AND"
         )
         dag.add_edge(hash_end, idx_and)
-
         idx_add = dag.add_op(
             Resource.VALU, 1, 1, "valu",
             [("+", ctx["idx"], ctx["idx"], ctx["tmp1"])],
             batch, rnd, "IDX_ADD"
         )
         dag.add_edge(idx_and, idx_add)
-        dag.add_edge(h2i, idx_add)  # idx_add must wait for h2i (both modify idx)
-
-        return idx_add
+        dag.add_edge(h2i, idx_add)
+        return idx_add, hash_end, idx_add
 
     def _build_hash(self, dag: DAG, batch: int, rnd: int, prev: Op) -> Op:
         ctx = self.contexts[batch]
@@ -819,7 +664,6 @@ class KernelBuilder:
             [("multiply_add", ctx["idx"], ctx["idx"], self.v_two, self.v_one)],
             batch, rnd, "H2I"
         )
-        # H2I only reads idx, not val - can start earlier
         dag.add_edge(prev, h2i)
 
         h3a = dag.add_op(
@@ -873,14 +717,11 @@ class KernelBuilder:
         dag.add_edge(h5a, h5)
         dag.add_edge(h5b, h5)
 
-        return h5, h2i  # Return both h5 (hash result) and h2i (idx update)
+        return h5, h2i
 
     def _build_store(self, dag: DAG, batch: int, prev_end: Op, prev_store_addr_ops) -> tuple:
         ctx = self.contexts[batch]
-        offset = batch * VLEN
-
         if batch == 0:
-            # First batch: use FLOW add_imm
             addr_idx = dag.add_op(
                 Resource.FLOW, 1, 1, "flow",
                 [("add_imm", ctx["node"], self.scratch["inp_indices_p"], 0)],
@@ -894,11 +735,8 @@ class KernelBuilder:
             dag.add_edge(prev_end, addr_idx)
             dag.add_edge(prev_end, addr_val)
         else:
-            # Subsequent batches: use ALU to add VLEN to previous batch's address
             prev_ctx = self.contexts[batch - 1]
             prev_addr_idx, prev_addr_val = prev_store_addr_ops
-
-            # Both ALU ops can run in same cycle (12 slots available)
             addr_idx = dag.add_op(
                 Resource.ALU, 1, 1, "alu",
                 [("+", ctx["node"], prev_ctx["node"], self.c_8)],
@@ -906,7 +744,6 @@ class KernelBuilder:
             )
             dag.add_edge(prev_end, addr_idx)
             dag.add_edge(prev_addr_idx, addr_idx)
-
             addr_val = dag.add_op(
                 Resource.ALU, 1, 1, "alu",
                 [("+", ctx["node"] + 1, prev_ctx["node"] + 1, self.c_8)],
@@ -921,20 +758,14 @@ class KernelBuilder:
             batch, -2, "STORE_IDX"
         )
         dag.add_edge(addr_idx, store_idx)
-
         store_val = dag.add_op(
             Resource.STORE, 1, 1, "store",
             [("vstore", ctx["node"] + 1, ctx["val"])],
             batch, -2, "STORE_VAL"
         )
         dag.add_edge(addr_val, store_val)
-
         return (addr_idx, addr_val)
 
-
-# ============================================================================
-# Test
-# ============================================================================
 
 BASELINE = 147734
 
@@ -954,7 +785,6 @@ def do_kernel_test(forest_height: int, rounds: int, batch_size: int, seed: int =
     for ref_mem in reference_kernel2(mem, value_trace):
         machine.run()
 
-    # Verify correctness
     inp_indices_p = mem[5]
     inp_values_p = mem[6]
     idx_ok = machine.mem[inp_indices_p:inp_indices_p + len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p + len(inp.indices)]
@@ -974,4 +804,4 @@ def do_kernel_test(forest_height: int, rounds: int, batch_size: int, seed: int =
 
 
 if __name__ == "__main__":
-    do_kernel_test(10, 16, 256, trace=True)
+    do_kernel_test(10, 16, 256, trace=False)
