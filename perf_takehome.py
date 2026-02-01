@@ -690,7 +690,6 @@ class KernelBuilder:
             while self.instrs and not self.instrs[-1]:
                 self.instrs.pop()
 
-        self.instrs.append({"flow": [("pause",)]})
 
 
 BASELINE = 147734
