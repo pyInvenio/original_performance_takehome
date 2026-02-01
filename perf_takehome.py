@@ -180,9 +180,9 @@ class KernelBuilder:
         v_two = self.alloc_vec("v_two")
         v_threshold = self.alloc_vec("v_threshold")  # For level 2 comparison
         v_n_nodes = self.alloc_vec("v_n_nodes")
-        v_forest_base = self.alloc_vec("v_forest_base")
         v_hash_const1 = [self.alloc_vec(f"v_hash{i}_const1") for i in range(6)]
-        v_hash_const2 = [self.alloc_vec(f"v_hash{i}_const2") for i in range(6)]
+        # Only stages 1, 3, 5 need shift constants (even stages use multiply_add)
+        v_hash_const2 = {i: self.alloc_vec(f"v_hash{i}_const2") for i in [1, 3, 5]}
         v_mult0 = self.alloc_vec("v_mult0")
         v_mult2 = self.alloc_vec("v_mult2")
         v_mult4 = self.alloc_vec("v_mult4")
@@ -200,7 +200,8 @@ class KernelBuilder:
         c_2 = self.alloc_scratch("c_2")
         c_threshold = self.alloc_scratch("c_threshold")
         hash_c1_addrs = [self.alloc_scratch(f"hash{i}_c1") for i in range(6)]
-        hash_c2_addrs = [self.alloc_scratch(f"hash{i}_c2") for i in range(6)]
+        # Only stages 1, 3, 5 need shift constants
+        hash_c2_addrs = {i: self.alloc_scratch(f"hash{i}_c2") for i in [1, 3, 5]}
         mult_addrs = [self.alloc_scratch("mult_0"), self.alloc_scratch("mult_1")]
         forest_cache = self.alloc_scratch("forest_cache", max(8, n_cached_nodes))
 
@@ -215,61 +216,85 @@ class KernelBuilder:
 
         # Load scalar constants
         self.instrs.append({"load": [("const", c_0, 0), ("const", c_1, 1)]})
-        self.instrs.append({"load": [("const", c_2, 2), ("const", c_threshold, level_2_threshold)]})
+        # Start first batch's address calculation early (FLOW is unused here)
+        # inp_indices_p was loaded 2 cycles ago, so it's ready
+        ctx0 = contexts[0]
+        self.instrs.append({
+            "load": [("const", c_2, 2), ("const", c_threshold, level_2_threshold)],
+            "flow": [("add_imm", ctx0["tmp1"], self.scratch["inp_indices_p"], 0)]
+        })
 
-        # Broadcast basic vector constants
-        self.instrs.append({"valu": [
-            ("vbroadcast", v_two, c_2),
-            ("vbroadcast", v_one, c_1),
-            ("vbroadcast", v_zero, c_0),
-            ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
-            ("vbroadcast", v_threshold, c_threshold),
-            ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]),
-        ]})
+        # Broadcast basic vector constants + batch 0 vloads
+        # Note: add_imm from previous cycle has latency 1, so addresses ready now
+        self.instrs.append({
+            "valu": [
+                ("vbroadcast", v_two, c_2),
+                ("vbroadcast", v_one, c_1),
+                ("vbroadcast", v_zero, c_0),
+                ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+            ],
+            "load": [("vload", ctx0["idx"], ctx0["tmp1"])],  # Batch 0 idx vload
+            "flow": [("add_imm", ctx0["tmp2"], self.scratch["inp_values_p"], 0)]
+        })
+        # Continue broadcasts + batch 0 val vload
+        self.instrs.append({
+            "valu": [("vbroadcast", v_threshold, c_threshold)],
+            "load": [("vload", ctx0["val"], ctx0["tmp2"])]  # Batch 0 val vload
+        })
 
         # Hash constants
         hash_const1_vals = [HASH_STAGES[i][1] for i in range(6)]
-        hash_const2_vals = [HASH_STAGES[i][4] for i in range(6)]
+        hash_const2_vals = {i: HASH_STAGES[i][4] for i in [1, 3, 5]}  # Only odd stages
         mult_vals = [1 + (1 << 12), 1 + (1 << 5), 1 + (1 << 3)]
 
+        # Load hash_const1 scalars (all 6 needed)
         for i in range(0, 6, 2):
             self.instrs.append({"load": [
                 ("const", hash_c1_addrs[i], hash_const1_vals[i]),
                 ("const", hash_c1_addrs[i + 1], hash_const1_vals[i + 1])
             ]})
-        for i in range(0, 6, 2):
-            self.instrs.append({
-                "load": [
-                    ("const", hash_c2_addrs[i], hash_const2_vals[i]),
-                    ("const", hash_c2_addrs[i + 1], hash_const2_vals[i + 1])
-                ],
-                "valu": [
-                    ("vbroadcast", v_hash_const1[i], hash_c1_addrs[i]),
-                    ("vbroadcast", v_hash_const1[i + 1], hash_c1_addrs[i + 1])
-                ]
-            })
+        # Load hash_const2 scalars (only 1, 3, 5 needed) and broadcast const1
         self.instrs.append({
             "load": [
-                ("const", mult_addrs[0], mult_vals[0]),
-                ("const", mult_addrs[1], mult_vals[1])
+                ("const", hash_c2_addrs[1], hash_const2_vals[1]),
+                ("const", hash_c2_addrs[3], hash_const2_vals[3])
             ],
             "valu": [
-                ("vbroadcast", v_hash_const2[0], hash_c2_addrs[0]),
+                ("vbroadcast", v_hash_const1[0], hash_c1_addrs[0]),
+                ("vbroadcast", v_hash_const1[1], hash_c1_addrs[1])
+            ]
+        })
+        self.instrs.append({
+            "load": [
+                ("const", hash_c2_addrs[5], hash_const2_vals[5]),
+                ("const", mult_addrs[0], mult_vals[0])
+            ],
+            "valu": [
+                ("vbroadcast", v_hash_const1[2], hash_c1_addrs[2]),
+                ("vbroadcast", v_hash_const1[3], hash_c1_addrs[3])
+            ]
+        })
+        self.instrs.append({
+            "load": [
+                ("const", mult_addrs[1], mult_vals[1]),
+                ("const", tmp1, mult_vals[2])
+            ],
+            "valu": [
+                ("vbroadcast", v_hash_const1[4], hash_c1_addrs[4]),
+                ("vbroadcast", v_hash_const1[5], hash_c1_addrs[5]),
                 ("vbroadcast", v_hash_const2[1], hash_c2_addrs[1]),
-                ("vbroadcast", v_hash_const2[2], hash_c2_addrs[2]),
                 ("vbroadcast", v_hash_const2[3], hash_c2_addrs[3]),
             ]
         })
         self.instrs.append({
-            "load": [
-                ("const", tmp1, mult_vals[2]),
-                ("vload", forest_cache, self.scratch["forest_values_p"])
-            ],
+            "load": [("vload", forest_cache, self.scratch["forest_values_p"])],
             "valu": [
-                ("vbroadcast", v_hash_const2[4], hash_c2_addrs[4]),
                 ("vbroadcast", v_hash_const2[5], hash_c2_addrs[5]),
             ]
         })
+
+        # Reuse hash0_c1 for c_8 (VLEN constant for incremental addressing)
+        c_8 = hash_c1_addrs[0]
 
         # Broadcast mult constants and forest nodes
         self.instrs.append({"valu": [
@@ -278,13 +303,10 @@ class KernelBuilder:
             ("vbroadcast", v_mult4, tmp1),
             ("vbroadcast", v_forest_nodes[n_cached_nodes - 1], forest_cache + n_cached_nodes - 1),
         ]})
-        self.instrs.append({"valu": [
-            ("vbroadcast", v_forest_nodes[i], forest_cache + i) for i in range(min(6, n_cached_nodes - 1))
-        ]})
-
-        # Reuse hash0_c1 for c_8 (VLEN constant for incremental addressing)
-        c_8 = hash_c1_addrs[0]
-        self.instrs.append({"load": [("const", c_8, VLEN)]})
+        self.instrs.append({
+            "valu": [("vbroadcast", v_forest_nodes[i], forest_cache + i) for i in range(min(6, n_cached_nodes - 1))],
+            "load": [("const", c_8, VLEN)]
+        })
 
         # === BUILD DAG ===
         dag = DAG()
@@ -293,6 +315,7 @@ class KernelBuilder:
 
         def build_hash(batch: int, rnd: int, prev: Op) -> tuple:
             ctx = contexts[batch]
+
             h0 = dag.add_op(Resource.VALU, 1, 1, "valu",
                 [("multiply_add", ctx["val"], ctx["val"], v_mult0, v_hash_const1[0])],
                 batch, rnd, "H0")
@@ -482,15 +505,22 @@ class KernelBuilder:
             return idx_add, hash_end, idx_add
 
         # Build init loads for each batch
+        # Batch 0's vloads are done in init phase, so we skip DAG ops for it
         for batch in range(n_batches):
             ctx = contexts[batch]
             if batch == 0:
-                addr_idx = dag.add_op(Resource.FLOW, 1, 1, "flow",
-                    [("add_imm", ctx["tmp1"], self.scratch["inp_indices_p"], 0)],
-                    batch, -1, "INIT_ADDR_IDX")
-                addr_val = dag.add_op(Resource.FLOW, 1, 1, "flow",
-                    [("add_imm", ctx["tmp2"], self.scratch["inp_values_p"], 0)],
-                    batch, -1, "INIT_ADDR_VAL")
+                # Batch 0 addresses and vloads done in init - create dummy ops for chaining
+                # These ops produce no instructions but allow batch 1 to chain properly
+                addr_idx = dag.add_op(Resource.FLOW, 0, 0, "flow", [], batch, -1, "INIT_ADDR_IDX_SKIP")
+                addr_val = dag.add_op(Resource.FLOW, 0, 0, "flow", [], batch, -1, "INIT_ADDR_VAL_SKIP")
+                # The vloads for batch 0 are done in init, data is already in ctx0 idx/val
+                # We don't need load_idx/load_val ops, just set prev_idx_update appropriately
+                prev_init_addr_ops = (addr_idx, addr_val)
+                prev_h5 = None
+                # Create a dummy op to represent that batch 0's data is ready
+                # This needs to have the right timing - the init vloads finish around cycle 8
+                load_val = dag.add_op(Resource.LOAD, 0, 0, "load", [], batch, -1, "INIT_LOAD_VAL_SKIP")
+                prev_idx_update = load_val
             else:
                 prev_ctx = contexts[batch - 1]
                 prev_addr_idx, prev_addr_val = prev_init_addr_ops
@@ -503,18 +533,18 @@ class KernelBuilder:
                     batch, -1, "INIT_ADDR_VAL")
                 dag.add_edge(prev_addr_val, addr_val)
 
-            load_idx = dag.add_op(Resource.LOAD, 1, 2, "load",
-                [("vload", ctx["idx"], ctx["tmp1"])],
-                batch, -1, "INIT_LOAD_IDX")
-            dag.add_edge(addr_idx, load_idx)
-            load_val = dag.add_op(Resource.LOAD, 1, 2, "load",
-                [("vload", ctx["val"], ctx["tmp2"])],
-                batch, -1, "INIT_LOAD_VAL")
-            dag.add_edge(addr_val, load_val)
+                load_idx = dag.add_op(Resource.LOAD, 1, 2, "load",
+                    [("vload", ctx["idx"], ctx["tmp1"])],
+                    batch, -1, "INIT_LOAD_IDX")
+                dag.add_edge(addr_idx, load_idx)
+                load_val = dag.add_op(Resource.LOAD, 1, 2, "load",
+                    [("vload", ctx["val"], ctx["tmp2"])],
+                    batch, -1, "INIT_LOAD_VAL")
+                dag.add_edge(addr_val, load_val)
 
-            prev_init_addr_ops = (addr_idx, addr_val)
-            prev_h5 = None
-            prev_idx_update = load_val
+                prev_init_addr_ops = (addr_idx, addr_val)
+                prev_h5 = None
+                prev_idx_update = load_val
 
             # Build rounds
             for rnd in range(rounds):
